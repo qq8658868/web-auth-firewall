@@ -1519,6 +1519,66 @@ custom_auth_path() {
   say "新登录地址: $(format_login_url "$(get_server_ip)")"
 }
 
+manage_whitelist() {
+  local action ip
+  require_installed || return 1
+  while true; do
+    clear 2>/dev/null || true
+    echo "============== 手动管理白名单 =============="
+    echo "当前白名单 IP："
+    python3 "${INSTALL_DIR}/manage.py" list whitelist
+    echo ""
+    echo "  a) 添加 IP 到白名单"
+    echo "  d) 从白名单删除 IP"
+    echo "  q) 返回上级菜单"
+    read -r -p "请选择 [a/d/q]: " action
+    case "${action}" in
+      a|A)
+        read -r -p "请输入要加入白名单的 IP: " ip
+        python3 "${INSTALL_DIR}/manage.py" add whitelist "${ip}"
+        ;;
+      d|D)
+        read -r -p "请输入要从白名单删除的 IP: " ip
+        python3 "${INSTALL_DIR}/manage.py" remove whitelist "${ip}"
+        ;;
+      q|Q|0)
+        return 0
+        ;;
+      *) warn "无效选项，请重新输入。" ;;
+    esac
+  done
+}
+
+manage_blacklist() {
+  local action ip
+  require_installed || return 1
+  while true; do
+    clear 2>/dev/null || true
+    echo "============== 手动管理黑名单 =============="
+    echo "当前黑名单 IP："
+    python3 "${INSTALL_DIR}/manage.py" list blacklist
+    echo ""
+    echo "  a) 添加 IP 到黑名单"
+    echo "  d) 从黑名单删除 IP"
+    echo "  q) 返回上级菜单"
+    read -r -p "请选择 [a/d/q]: " action
+    case "${action}" in
+      a|A)
+        read -r -p "请输入要加入黑名单的 IP: " ip
+        python3 "${INSTALL_DIR}/manage.py" add blacklist "${ip}"
+        ;;
+      d|D)
+        read -r -p "请输入要从黑名单删除的 IP: " ip
+        python3 "${INSTALL_DIR}/manage.py" remove blacklist "${ip}"
+        ;;
+      q|Q|0)
+        return 0
+        ;;
+      *) warn "无效选项，请重新输入。" ;;
+    esac
+  done
+}
+
 show_menu() {
   local server_ip
   server_ip="$(get_server_ip)"
@@ -1531,14 +1591,12 @@ show_menu() {
   echo "  1) 安装 / 更新 Web 认证防火墙"
   echo "  2) 显示白名单 IP"
   echo "  3) 显示黑名单 IP"
-  echo "  4) 手动添加白名单 IP"
-  echo "  5) 手动删除白名单 IP"
-  echo "  6) 手动添加黑名单 IP"
-  echo "  7) 手动删除黑名单 IP"
-  echo "  8) 重置 / 修改用户名和密码"
-  echo "  9) 查看服务状态与防火墙规则"
-  echo " 10) 卸载 Web 认证防火墙"
-  echo " 11) 自定义登录地址"
+  echo "  4) 手动管理白名单（添加 / 删除）"
+  echo "  5) 手动管理黑名单（添加 / 删除）"
+  echo "  6) 重置 / 修改用户名和密码"
+  echo "  7) 查看服务状态与防火墙规则"
+  echo "  8) 卸载 Web 认证防火墙"
+  echo "  9) 自定义登录地址"
   echo "  0) 退出"
   echo "====================================================="
 }
@@ -1547,19 +1605,17 @@ menu() {
   local choice ip
   while true; do
     show_menu
-    read -r -p "请选择操作 [0-11]: " choice
+    read -r -p "请选择操作 [0-9]: " choice
     case "${choice}" in
       1) install_web_auth ;;
       2) if require_installed; then python3 "${INSTALL_DIR}/manage.py" list whitelist; fi ;;
       3) if require_installed; then python3 "${INSTALL_DIR}/manage.py" list blacklist; fi ;;
-      4) if require_installed; then read -r -p "请输入要加入白名单的 IP: " ip; python3 "${INSTALL_DIR}/manage.py" add whitelist "${ip}"; fi ;;
-      5) if require_installed; then read -r -p "请输入要从白名单删除的 IP: " ip; python3 "${INSTALL_DIR}/manage.py" remove whitelist "${ip}"; fi ;;
-      6) if require_installed; then read -r -p "请输入要加入黑名单的 IP: " ip; python3 "${INSTALL_DIR}/manage.py" add blacklist "${ip}"; fi ;;
-      7) if require_installed; then read -r -p "请输入要从黑名单删除的 IP: " ip; python3 "${INSTALL_DIR}/manage.py" remove blacklist "${ip}"; fi ;;
-      8) change_credentials ;;
-      9) if require_installed; then systemctl status "${SERVICE}" --no-pager || true; echo ""; nft list table inet "${NFT_TABLE}" || true; fi ;;
-      10) read -r -p "确定要卸载吗？输入 yes 确认: " confirm; if [[ "${confirm}" == "yes" ]]; then uninstall; fi ;;
-      11) custom_auth_path ;;
+      4) manage_whitelist ;;
+      5) manage_blacklist ;;
+      6) change_credentials ;;
+      7) if require_installed; then systemctl status "${SERVICE}" --no-pager || true; echo ""; nft list table inet "${NFT_TABLE}" || true; fi ;;
+      8) read -r -p "确定要卸载吗？输入 yes 确认: " confirm; if [[ "${confirm}" == "yes" ]]; then uninstall; fi ;;
+      9) custom_auth_path ;;
       0|q|Q) say "退出管理面板。"; exit 0 ;;
       *) warn "无效选项，请重新输入。" ;;
     esac
