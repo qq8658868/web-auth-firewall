@@ -15,9 +15,10 @@
 ## 功能
 
 - nftables INPUT 默认策略为 DROP，默认只放行 TCP 18622（认证服务）。
+- 默认禁止 ping；只有加入白名单的 IP 可以 ping 并访问服务器所有 TCP/UDP 端口。
 - 任意 IP 都可以访问登录页面（默认 `http://服务器IP:18622/`，可配置自定义路径，例如 `/sdfcxsd`）。
 - 登录成功后，客户端 IP 写入白名单，可访问服务器全部端口和服务。
-- 5 分钟内连续 3 次登录失败后，客户端 IP 写入黑名单，服务器所有端口（包括 18622）拒绝访问。
+- 5 分钟内连续 3 次登录失败后，客户端 IP 写入黑名单，服务器所有端口（包括 18622）和 ping 均拒绝访问。
 - 白名单地址保留 48 小时，到期自动清空；重新登录会刷新 48 小时有效期。
 - 黑名单地址同样保留 48 小时，到期自动清除，管理员也可以随时手动清除。
 - 登录成功页面内置访问名单管理：可查看当前白名单/黑名单，并手动添加、删除 IP。
@@ -57,18 +58,18 @@ sudo ./setup_web_firewall.sh
 1) 安装 / 更新 Web 认证防火墙
 2) 显示白名单 IP
 3) 显示黑名单 IP
-4) 手动添加白名单 IP
-5) 手动删除白名单 IP
-6) 手动添加黑名单 IP
-7) 手动删除黑名单 IP
-8) 重置 / 修改用户名和密码
-9) 查看服务状态与防火墙规则
-10) 卸载 Web 认证防火墙
-11) 自定义登录地址
+4) 手动管理白名单（添加 / 删除）
+5) 手动管理黑名单（添加 / 删除）
+6) 重置 / 修改用户名和密码
+7) 查看服务状态与防火墙规则
+8) 卸载 Web 认证防火墙
+9) 自定义登录地址
 0) 退出
 ```
 
 菜单顶部会自动显示当前服务器的 Web 登录地址（包含自定义路径），方便忘记登录地址时随时查看。
+
+“手动管理白名单/黑名单”进入后会先显示当前列表，输入 `a` 添加 IP、`d` 删除 IP、`q` 返回上级菜单，可连续操作。
 
 也可以直接用安装后的管理脚本：
 
@@ -88,7 +89,7 @@ sudo ./setup_web_firewall.sh --port 18622        # 自定义认证端口（默�
 sudo ./setup_web_firewall.sh --path /sdfcxsd     # 自定义登录路径
 sudo ./setup_web_firewall.sh --random-path       # 安装时自动生成随机登录路径
 sudo ./setup_web_firewall.sh --no-keep-ssh       # 不自动放行当前 SSH IP
-sudo ./setup_web_firewall.sh --allow-icmp        # 额外允许 ICMP ping
+sudo ./setup_web_firewall.sh --allow-icmp        # 允许任意 IP ping（默认禁止）
 sudo ./setup_web_firewall.sh --menu              # 打开交互式管理菜单
 sudo ./setup_web_firewall.sh --change-credentials  # 修改用户名/密码
 sudo ./setup_web_firewall.sh --uninstall         # 卸载并恢复之前的规则
@@ -150,3 +151,4 @@ systemctl restart web-auth-firewall
 - 脚本会禁用 ufw 和 firewalld，避免两套防火墙互相冲突。
 - 如果服务器运行 Docker，请先确认 Docker 的端口映射策略与本规则兼容；Docker 的 nftables/iptables 表可能被 `flush ruleset` 清理。
 - 同一 IP 在 5 分钟内累计 3 次登录失败才会被拉黑；拉黑后无法再访问 18622 认证页面，需要管理员在命令行菜单中手动解除，或等待 48 小时自动过期。
+- ping 使用 ICMP 协议，不属于 TCP/UDP 端口：默认情况下只有白名单 IP 可以 ping；如需让任意 IP 都能 ping，请使用 `--allow-icmp` 安装。
