@@ -2,7 +2,7 @@
 
 一个自包含安装脚本，把主流 Linux 服务器改造成“先登录、后放行”的白名单访问模型。
 
-当前版本：1.1.0
+当前版本：1.1.1
 
 ## 支持的系统
 
@@ -161,6 +161,10 @@ systemctl restart web-auth-firewall
 - ping 使用 ICMP 协议，不属于 TCP/UDP 端口：默认情况下只有白名单 IP 可以 ping；如需让任意 IP 都能 ping，请使用 `--allow-icmp` 安装。
 
 ## 更新日志
+
+### 1.1.1
+
+- 修复卸载时无法删除带 immutable 锁的 `credentials` 等文件的问题，卸载前会自动解除只读属性。
 
 ### 1.1.0
 
