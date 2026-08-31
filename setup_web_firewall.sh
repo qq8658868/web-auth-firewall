@@ -30,6 +30,7 @@ STATE_FILE="${STATE_DIR}/state.json"
 CRED_FILE="${ETC_DIR}/credentials"
 NFT_CONF="/etc/nftables.conf"
 NFT_BACKUP="${NFT_CONF}.pre-web-auth"
+AUTH_PORT_CONFIG="${ETC_DIR}/auth_port"
 
 KEEP_SSH="auto"
 ALLOW_ICMP=0
@@ -103,6 +104,10 @@ parse_args() {
         ;;
       --random-path)
         AUTH_PATH="/$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)"
+        shift
+        ;;
+      --update-geoip)
+        ACTION="update_geoip"
         shift
         ;;
       --keep-ssh)
@@ -190,11 +195,11 @@ detect_package_manager() {
 install_packages() {
   local pkgs=()
   case "${PKG_MGR}" in
-    apt) pkgs=(nftables python3) ;;
-    dnf|yum) pkgs=(nftables python3) ;;
-    zypper) pkgs=(nftables python3) ;;
-    pacman) pkgs=(nftables python) ;;
-    apk) pkgs=(nftables python3) ;;
+    apt) pkgs=(nftables python3 curl unzip) ;;
+    dnf|yum) pkgs=(nftables python3 curl unzip) ;;
+    zypper) pkgs=(nftables python3 curl unzip) ;;
+    pacman) pkgs=(nftables python curl unzip) ;;
+    apk) pkgs=(nftables python3 curl unzip) ;;
   esac
   say "Installing packages: ${pkgs[*]}"
   case "${PKG_MGR}" in
@@ -244,6 +249,28 @@ backup_existing_ruleset() {
     cp -a "${NFT_CONF}" "${NFT_BACKUP}"
     say "Backed up existing ruleset to ${NFT_BACKUP}"
   fi
+}
+
+save_pre_install_state() {
+  install -d -m 700 "${ETC_DIR}"
+  {
+    if systemctl is-enabled --quiet nftables 2>/dev/null; then
+      echo "nft_enabled=yes"
+    else
+      echo "nft_enabled=no"
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+      echo "ufw_active=yes"
+    else
+      echo "ufw_active=no"
+    fi
+    if systemctl is-active --quiet firewalld 2>/dev/null; then
+      echo "fw_active=yes"
+    else
+      echo "fw_active=no"
+    fi
+  } > "${ETC_DIR}/pre_install_state"
+  chmod 600 "${ETC_DIR}/pre_install_state"
 }
 
 stop_conflicting_firewalls() {
@@ -306,7 +333,20 @@ from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
+try:
+    import geoip
+except ImportError:
+    geoip = None
+
+AUTH_PORT_CONFIG = os.environ.get("AUTH_PORT_CONFIG", "/etc/web-auth-firewall/auth_port")
 AUTH_PORT = int(os.environ.get("AUTH_PORT", "18622"))
+try:
+    with open(AUTH_PORT_CONFIG, "r", encoding="ascii") as fh:
+        configured_port = fh.read().strip()
+    if configured_port:
+        AUTH_PORT = int(configured_port)
+except (OSError, ValueError):
+    pass
 NFT_TABLE = os.environ.get("NFT_TABLE", "web_auth")
 CRED_FILE = os.environ.get("CRED_FILE", "/etc/web-auth-firewall/credentials")
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/web-auth-firewall/state.json")
@@ -334,15 +374,70 @@ LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
 EXPECTED_USER = "admin"
 EXPECTED_PASSWORD_HASH = "b03ddf3ca2e714a6548e7495e2a03f5e824eaac9837cd7f159c67b90fb4b7342"
 
-# Whitelist and blacklist entries are kept for 48 hours and then removed.
-WHITELIST_TTL_SECONDS = 48 * 60 * 60
-BLACKLIST_TTL_SECONDS = 48 * 60 * 60
+DEFAULT_TTL_HOURS = 48
+MAX_TTL_HOURS = 720
+WHITELIST_TTL_HOURS = DEFAULT_TTL_HOURS
+BLACKLIST_TTL_HOURS = DEFAULT_TTL_HOURS
+WHITELIST_TTL_SECONDS = WHITELIST_TTL_HOURS * 3600
+BLACKLIST_TTL_SECONDS = BLACKLIST_TTL_HOURS * 3600
+TTL_CONFIG = os.environ.get("TTL_CONFIG", "/var/lib/web-auth-firewall/ttl.json")
+try:
+    with open(TTL_CONFIG, "r", encoding="utf-8") as fh:
+        _ttl_data = json.load(fh)
+    WHITELIST_TTL_HOURS = max(1, min(MAX_TTL_HOURS, int(_ttl_data.get("whitelist_hours", WHITELIST_TTL_HOURS))))
+    BLACKLIST_TTL_HOURS = max(1, min(MAX_TTL_HOURS, int(_ttl_data.get("blacklist_hours", BLACKLIST_TTL_HOURS))))
+    WHITELIST_TTL_SECONDS = WHITELIST_TTL_HOURS * 3600
+    BLACKLIST_TTL_SECONDS = BLACKLIST_TTL_HOURS * 3600
+except (OSError, ValueError, TypeError):
+    pass
+
+
+def set_global_ttl(whitelist_hours, blacklist_hours):
+    global WHITELIST_TTL_SECONDS, BLACKLIST_TTL_SECONDS
+    global WHITELIST_TTL_HOURS, BLACKLIST_TTL_HOURS
+    WHITELIST_TTL_HOURS = max(1, min(MAX_TTL_HOURS, int(whitelist_hours)))
+    BLACKLIST_TTL_HOURS = max(1, min(MAX_TTL_HOURS, int(blacklist_hours)))
+    WHITELIST_TTL_SECONDS = WHITELIST_TTL_HOURS * 3600
+    BLACKLIST_TTL_SECONDS = BLACKLIST_TTL_HOURS * 3600
+    os.makedirs(os.path.dirname(TTL_CONFIG) or ".", exist_ok=True)
+    tmp = TTL_CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"whitelist_hours": WHITELIST_TTL_HOURS, "blacklist_hours": BLACKLIST_TTL_HOURS},
+            fh,
+            indent=2,
+            sort_keys=True,
+        )
+        fh.write("\n")
+    os.replace(tmp, TTL_CONFIG)
+    with STATE_LOCK:
+        now = time.time()
+        whitelist_refreshed = 0
+        blacklist_refreshed = 0
+        for family in FAMILIES:
+            for ip, expires in list(STATE["whitelist"][family].items()):
+                if expires > now:
+                    STATE["whitelist"][family][ip] = now + WHITELIST_TTL_SECONDS
+                    whitelist_refreshed += 1
+            for ip, expires in list(STATE["blacklist"][family].items()):
+                if expires > now:
+                    STATE["blacklist"][family][ip] = now + BLACKLIST_TTL_SECONDS
+                    blacklist_refreshed += 1
+        save_state(STATE)
+    LOG.info(
+        "global TTL updated: whitelist %dh (%d refreshed), blacklist %dh (%d refreshed)",
+        WHITELIST_TTL_HOURS, whitelist_refreshed, BLACKLIST_TTL_HOURS, blacklist_refreshed,
+    )
 
 # A client is blacklisted after 3 failed logins within 5 minutes.
 FAIL_WINDOW_SECONDS = 5 * 60
 MAX_FAILED_ATTEMPTS = 3
 FAILED_ATTEMPTS = {}
 FAIL_LOCK = threading.RLock()
+RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "300"))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "16"))
+_REQUEST_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+_PORT_CACHE = {"ts": 0.0, "tcp": [], "udp": []}
 
 WHITELIST_SETS = {"4": "whitelist_v4", "6": "whitelist_v6"}
 BLACKLIST_SETS = {"4": "blacklist_v4", "6": "blacklist_v6"}
@@ -519,31 +614,33 @@ def reconcile():
         )
 
 
-def grant_access(ip, family):
+def grant_access(ip, family, ttl_seconds=None):
     with STATE_LOCK:
         if ip in STATE["blacklist"][family]:
             del STATE["blacklist"][family][ip]
             nft_ok("delete", "element", "inet", NFT_TABLE, set_name("blacklist", family), "{", ip, "}")
-        STATE["whitelist"][family][ip] = time.time() + WHITELIST_TTL_SECONDS
+        ttl = ttl_seconds if ttl_seconds else WHITELIST_TTL_SECONDS
+        STATE["whitelist"][family][ip] = time.time() + ttl
         nft_ok("add", "element", "inet", NFT_TABLE, set_name("whitelist", family), "{", ip, "}")
         save_state(STATE)
         LOG.info(
             "granted access to %s (family %s) for %d seconds",
-            ip, family, WHITELIST_TTL_SECONDS,
+            ip, family, ttl,
         )
 
 
-def revoke_access(ip, family):
+def revoke_access(ip, family, ttl_seconds=None):
     with STATE_LOCK:
         if ip in STATE["whitelist"][family]:
             del STATE["whitelist"][family][ip]
             nft_ok("delete", "element", "inet", NFT_TABLE, set_name("whitelist", family), "{", ip, "}")
-        STATE["blacklist"][family][ip] = time.time() + BLACKLIST_TTL_SECONDS
+        ttl = ttl_seconds if ttl_seconds else BLACKLIST_TTL_SECONDS
+        STATE["blacklist"][family][ip] = time.time() + ttl
         nft_ok("add", "element", "inet", NFT_TABLE, set_name("blacklist", family), "{", ip, "}")
         save_state(STATE)
         LOG.warning(
             "revoked access from %s (family %s) for %d seconds",
-            ip, family, BLACKLIST_TTL_SECONDS,
+            ip, family, ttl,
         )
 
 
@@ -636,29 +733,70 @@ def collect_udp_ports():
     return sorted(ports)
 
 
+def collect_open_ports_cached():
+    now = time.time()
+    if now - _PORT_CACHE["ts"] < 10:
+        return _PORT_CACHE["tcp"], _PORT_CACHE["udp"]
+    tcp_ports = collect_tcp_ports()
+    udp_ports = collect_udp_ports()
+    _PORT_CACHE["tcp"] = tcp_ports
+    _PORT_CACHE["udp"] = udp_ports
+    _PORT_CACHE["ts"] = now
+    return tcp_ports, udp_ports
+
+
 def port_badges(ports):
     if not ports:
         return '<span class="port">无</span>'
     return "".join('<span class="port">%d</span>' % port for port in ports)
 
 
+COUNTRY_NAMES = {
+    "CN": "中国", "US": "美国", "JP": "日本", "KR": "韩国", "SG": "新加坡",
+    "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门", "GB": "英国", "DE": "德国",
+    "FR": "法国", "RU": "俄罗斯", "CA": "加拿大", "AU": "澳大利亚", "IN": "印度",
+    "NL": "荷兰", "SE": "瑞典", "CH": "瑞士", "IT": "意大利", "ES": "西班牙",
+    "BR": "巴西", "MX": "墨西哥", "ZA": "南非", "EG": "埃及", "TR": "土耳其",
+    "AE": "阿联酋", "SA": "沙特阿拉伯", "ID": "印度尼西亚", "TH": "泰国", "VN": "越南",
+    "PH": "菲律宾", "MY": "马来西亚", "PK": "巴基斯坦", "BD": "孟加拉国", "UA": "乌克兰",
+    "PL": "波兰", "CZ": "捷克", "AT": "奥地利", "BE": "比利时", "DK": "丹麦",
+    "FI": "芬兰", "NO": "挪威", "IE": "爱尔兰", "NZ": "新西兰", "AR": "阿根廷",
+    "CL": "智利", "CO": "哥伦比亚", "PE": "秘鲁", "RO": "罗马尼亚", "GR": "希腊",
+}
+
+
+def geo_label(ip):
+    if geoip is None or not geoip.is_available():
+        return '<span class="geo unknown">未知</span>'
+    info = geoip.country(ip)
+    if not info:
+        return '<span class="geo unknown">未知</span>'
+    label = COUNTRY_NAMES.get(info, info)
+    return '<span class="geo">%s</span>' % escape(label)
+
+
 def render_list_rows(kind):
     rows = []
     action = "remove_whitelist" if kind == "whitelist" else "remove_blacklist"
+    now = time.time()
     for family in FAMILIES:
         family_label = "IPv4" if family == "4" else "IPv6"
-        for ip in STATE[kind][family]:
+        for ip, expires in STATE[kind][family].items():
             safe_ip = escape(ip)
+            remaining = int((expires - now) / 3600 + 0.5)
+            expiry_label = "<1h" if remaining < 1 else "剩余%dh" % remaining
             rows.append(
                 '<div class="iprow">'
                 '<span class="ipaddr">%s</span>'
                 '<span class="family">%s</span>'
+                '<span class="expiry">%s</span>'
+                '%s'
                 '<form method="post" action="%s">'
                 '<input type="hidden" name="action" value="%s">'
                 '<input type="hidden" name="ip" value="%s">'
                 '<button type="submit" class="small danger">删除</button>'
                 "</form>"
-                "</div>" % (safe_ip, family_label, MANAGE_ACTION, action, safe_ip)
+                "</div>" % (safe_ip, family_label, expiry_label, geo_label(ip), MANAGE_ACTION, action, safe_ip)
             )
     if not rows:
         return '<div class="empty">无</div>'
@@ -666,19 +804,25 @@ def render_list_rows(kind):
 
 
 def render_success_page(client_ip, message=""):
-    tcp_ports = collect_tcp_ports()
-    udp_ports = collect_udp_ports()
+    tcp_ports, udp_ports = collect_open_ports_cached()
     msg_html = ""
     if message:
         msg_html = '<div class="msg">%s</div>' % escape(message)
+    geo_notice = ""
+    if geoip is None or not geoip.is_available():
+        geo_notice = '<div class="msg">未安装 GeoIP 数据库，请在后台菜单选择“更新 GeoIP 数据库”。</div>'
     return (
         SUCCESS_PAGE
         .replace("__CLIENT_IP__", escape(client_ip))
+        .replace("__CLIENT_GEO__", geo_label(client_ip))
         .replace("__TCP_PORTS__", port_badges(tcp_ports))
         .replace("__UDP_PORTS__", port_badges(udp_ports))
         .replace("__WHITELIST_ROWS__", render_list_rows("whitelist"))
         .replace("__BLACKLIST_ROWS__", render_list_rows("blacklist"))
+        .replace("__WHITELIST_TTL__", str(WHITELIST_TTL_HOURS))
+        .replace("__BLACKLIST_TTL__", str(BLACKLIST_TTL_HOURS))
         .replace("__MANAGE_MESSAGE__", msg_html)
+        .replace("__GEOIP_NOTICE__", geo_notice)
         .replace("__MANAGE_ACTION__", MANAGE_ACTION)
         .replace("__LOGOUT_ACTION__", LOGOUT_ACTION)
     )
@@ -704,19 +848,21 @@ LOGIN_PAGE = """<!doctype html>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; color: #0f172a; }
-.card { width: min(92vw, 380px); background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px;
+       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+       color: #0f172a; padding: 16px; }
+.card { width: min(92vw, 400px); background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
         padding: 32px 28px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); }
-h1 { font-size: 20px; margin: 0 0 6px; }
-p { color: #475569; font-size: 13px; margin: 0 0 20px; }
+h1 { font-size: 20px; margin: 0 0 6px; color: #0f172a; }
+p { color: #64748b; font-size: 13px; margin: 0 0 20px; }
 label { display: block; font-size: 13px; font-weight: 600; margin: 14px 0 6px; }
-input { width: 100%; height: 40px; padding: 0 10px; border: 1px solid #94a3b8; border-radius: 6px; font-size: 14px; }
+input { width: 100%; height: 40px; padding: 0 10px; border: 1px solid #cbd5e1; border-radius: 6px;
+        background: #ffffff; color: #0f172a; font-size: 14px; }
 button { width: 100%; height: 42px; margin-top: 20px; border: 0; border-radius: 6px;
-         background: #0f766e; color: #ffffff; font-size: 14px; font-weight: 600; cursor: pointer; }
-button:hover { background: #115e59; }
+         background: #2563eb; color: #ffffff; font-size: 14px; font-weight: 600; cursor: pointer; }
+button:hover { background: #1d4ed8; }
 .notice { margin-bottom: 16px; padding: 10px 12px; border-radius: 6px; font-size: 13px;
-          background: #f0fdf4; color: #166534; border: 1px solid #a7f3d0; }
-.muted { margin-top: 18px; text-align: center; color: #64748b; }
+          background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+.muted { margin-top: 18px; text-align: center; color: #94a3b8; }
 </style>
 </head>
 <body>
@@ -745,59 +891,85 @@ SUCCESS_PAGE = """<!doctype html>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; color: #0f172a; padding: 24px; }
-.card { width: min(94vw, 780px); background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px;
-        padding: 32px 28px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); }
-.topbar { display: flex; justify-content: flex-end; margin-bottom: 10px; }
-.logoutbtn { display: inline-block; padding: 7px 14px; border-radius: 6px; font-size: 13px;
+       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+       color: #0f172a; padding: 24px; }
+.card { width: min(96vw, 960px); background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
+        padding: 28px 24px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); }
+.logoutbtn { display: inline-block; padding: 8px 20px; border-radius: 6px; font-size: 13px;
              text-decoration: none; background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; }
 .logoutbtn:hover { background: #e2e8f0; }
-h1 { font-size: 20px; margin: 0 0 4px; color: #047857; }
-.subtitle { color: #475569; font-size: 13px; margin: 0 0 20px; }
-.ipbox { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-         background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 12px 14px; margin-bottom: 20px; }
-.ipbox .label { font-size: 12px; color: #065f46; }
-.ipbox .value { font-family: Consolas, monospace; font-size: 16px; font-weight: 700; color: #065f46; }
+h1 { font-size: 22px; margin: 0 0 6px; color: #0f172a; }
+.subtitle { color: #64748b; font-size: 13px; margin: 0 0 18px; }
+.ipbox { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center;
+         background: linear-gradient(135deg, #f0f9ff, #eff6ff); border: 1px solid #93c5fd; border-radius: 10px;
+         padding: 20px 16px; margin-bottom: 20px; }
+.ipbox .label { font-size: 13px; color: #1d4ed8; }
+.ipbox .value { font-family: Consolas, monospace; font-size: 26px; font-weight: 800; color: #1d4ed8; margin-top: 8px; }
 .ports { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.section { border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; }
-.section h2 { font-size: 13px; margin: 0 0 10px; }
+.section { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px; }
+.section h2 { font-size: 13px; margin: 0 0 10px; color: #475569; }
 .section .tag { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 2px 6px; margin-right: 6px; }
-.tcp .tag { background: #dbeafe; color: #1d4ed8; }
+.tcp .tag { background: #1d4ed8; color: #dbeafe; }
 .udp .tag { background: #fef3c7; color: #92400e; }
 .portlist { display: flex; flex-wrap: wrap; gap: 6px; }
-.port { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 3px 7px;
-        font-family: Consolas, monospace; font-size: 12px; }
-.manage { margin-top: 22px; border-top: 1px solid #e2e8f0; padding-top: 16px; }
+.port { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 3px 8px;
+        font-family: Consolas, monospace; font-size: 12px; color: #334155; }
+.manage { margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 16px; }
 .manage > h2 { font-size: 15px; margin: 0 0 12px; color: #0f172a; }
 .manage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.listbox { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
-.listbox h3 { font-size: 12px; margin: 0 0 8px; color: #334155; }
-.iprow { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #e2e8f0; }
+.listbox { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
+.listhead { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.listhead h3 { font-size: 12px; margin: 0; color: #334155; }
+.ttlinline { display: flex; align-items: center; gap: 4px; }
+.ttlinline input { width: 64px; height: 28px; padding: 0 6px; border: 1px solid #cbd5e1; border-radius: 6px;
+                   background: #ffffff; color: #0f172a; font-size: 12px; }
+.ttlinline button { height: 28px; }
+.iprow { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px dashed #e2e8f0; flex-wrap: nowrap; }
 .iprow:last-child { border-bottom: 0; }
-.ipaddr { font-family: Consolas, monospace; font-size: 12px; flex: 1; overflow-wrap: anywhere; }
-.family { font-size: 10px; color: #64748b; }
-.empty { color: #94a3b8; font-size: 12px; padding: 4px 0; }
-button.small { height: 26px; padding: 0 10px; font-size: 12px; border: 0; border-radius: 5px; cursor: pointer; }
+.ipaddr { font-family: Consolas, monospace; font-size: 14px; color: #0f172a; flex: 1 1 auto; min-width: 0;
+          white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.family { font-size: 10px; color: #94a3b8; white-space: nowrap; }
+.expiry { font-size: 10px; color: #b45309; background: #fef3c7; border: 1px solid #fde68a;
+          border-radius: 4px; padding: 1px 5px; margin-right: 6px; white-space: nowrap; }
+.geo { display: inline-block; font-size: 10px; color: #0f766e; background: #ecfdf5;
+       border: 1px solid #a7f3d0; border-radius: 4px; padding: 1px 5px; margin-right: 6px; white-space: nowrap; }
+.geo.unknown { color: #64748b; background: #f1f5f9; border-color: #e2e8f0; }
+.clientgeo { margin-top: 8px; font-size: 13px; color: #1d4ed8; }
+.empty { color: #64748b; font-size: 12px; padding: 4px 0; }
+button.small { height: 28px; padding: 0 10px; font-size: 12px; border: 0; border-radius: 5px; cursor: pointer; white-space: nowrap; }
 button.danger { background: #fee2e2; color: #b91c1c; }
 button.add { background: #0f766e; color: #ffffff; }
 .addforms { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
 .addform { display: flex; gap: 8px; }
-.addform input { flex: 1; min-width: 0; height: 36px; padding: 0 10px; border: 1px solid #94a3b8; border-radius: 6px; font-size: 13px; }
-.addform button { flex-shrink: 0; height: 36px; }
-.msg { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 13px; background: #f0fdf4; color: #166534; }
-.note { margin-top: 10px; font-size: 11px; color: #94a3b8; }
+.addform input { flex: 1; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #cbd5e1; border-radius: 6px;
+                 background: #ffffff; color: #0f172a; font-size: 13px; }
+.addform button { flex-shrink: 0; height: 38px; }
+.msg { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 13px;
+       background: #f0fdf4; color: #166534; border: 1px solid #a7f3d0; }
+.note { margin-top: 10px; font-size: 11px; color: #64748b; }
 .muted { margin-top: 18px; text-align: center; color: #64748b; font-size: 12px; }
-@media (max-width: 640px) { .ports, .manage-grid, .addforms { grid-template-columns: 1fr; } }
+.footer { display: flex; justify-content: center; margin-top: 18px; }
+@media (max-width: 640px) {
+  body { padding: 12px; }
+  .card { padding: 18px 12px; border-radius: 8px; }
+  .ipbox .value { font-size: 20px; }
+  .ports, .manage-grid, .addforms { grid-template-columns: 1fr; }
+  .iprow { gap: 5px; }
+  .ipaddr { font-size: 12px; }
+  .family { display: none; }
+  .expiry, .geo { font-size: 10px; }
+  button.small { padding: 0 7px; font-size: 11px; }
+}
 </style>
 </head>
 <body>
 <div class="card">
-  <div class="topbar"><a class="logoutbtn" href="__LOGOUT_ACTION__">退出登录 / Log Out</a></div>
-  <h1>登录成功 / Login Successful</h1>
+  <h1>登录成功</h1>
   <p class="subtitle">您的 IP 已加入白名单，现在可以访问服务器全部端口和服务。</p>
   <div class="ipbox">
     <span class="label">您的客户端 IP（已加入白名单）</span>
     <span class="value">__CLIENT_IP__</span>
+    <div class="clientgeo">__CLIENT_GEO__</div>
   </div>
   <div class="ports">
     <div class="section tcp">
@@ -813,11 +985,27 @@ button.add { background: #0f766e; color: #ffffff; }
     <h2>访问名单管理 / Access List Management</h2>
     <div class="manage-grid">
       <div class="listbox">
-        <h3>白名单 IP（48 小时有效）</h3>
+        <div class="listhead">
+          <h3>白名单 IP（__WHITELIST_TTL__ 小时有效）</h3>
+          <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+            <input type="hidden" name="action" value="update_ttl">
+            <input type="hidden" name="blacklist_hours" value="__BLACKLIST_TTL__">
+            <input name="whitelist_hours" type="number" min="1" max="720" value="__WHITELIST_TTL__" title="白名单有效小时数" required>
+            <button type="submit" class="small add">保存</button>
+          </form>
+        </div>
         __WHITELIST_ROWS__
       </div>
       <div class="listbox">
-        <h3>黑名单 IP（48 小时有效）</h3>
+        <div class="listhead">
+          <h3>黑名单 IP（__BLACKLIST_TTL__ 小时有效）</h3>
+          <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+            <input type="hidden" name="action" value="update_ttl">
+            <input type="hidden" name="whitelist_hours" value="__WHITELIST_TTL__">
+            <input name="blacklist_hours" type="number" min="1" max="720" value="__BLACKLIST_TTL__" title="黑名单有效小时数" required>
+            <button type="submit" class="small add">保存</button>
+          </form>
+        </div>
         __BLACKLIST_ROWS__
       </div>
     </div>
@@ -834,9 +1022,11 @@ button.add { background: #0f766e; color: #ffffff; }
       </form>
     </div>
     __MANAGE_MESSAGE__
+    __GEOIP_NOTICE__
     <p class="note">删除自己的 IP 后将立即失去服务器访问权限。</p>
   </div>
-  <p class="muted">白名单有效期 48 小时，到期后需重新登录。Your IP address has been whitelisted.</p>
+  <p class="muted">白名单有效期 __WHITELIST_TTL__ 小时，到期后需重新登录。Your IP address has been whitelisted.</p>
+  <div class="footer"><a class="logoutbtn" href="__LOGOUT_ACTION__">退出登录 / Log Out</a></div>
 </div>
 </body>
 </html>"""
@@ -850,12 +1040,13 @@ FORBIDDEN_PAGE = """<!doctype html>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-       background: #fef2f2; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; color: #0f172a; }
-.card { width: min(92vw, 420px); background: #ffffff; border: 1px solid #fecaca; border-radius: 8px;
+       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+       color: #0f172a; padding: 16px; }
+.card { width: min(92vw, 420px); background: #ffffff; border: 1px solid #fecaca; border-radius: 10px;
         padding: 32px 28px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); text-align: center; }
 h1 { font-size: 20px; margin: 0 0 10px; color: #b91c1c; }
-p { color: #334155; font-size: 14px; margin: 0 0 16px; }
-a { color: #0f766e; }
+p { color: #64748b; font-size: 14px; margin: 0 0 16px; }
+a { color: #1d4ed8; }
 </style>
 </head>
 <body>
@@ -876,12 +1067,13 @@ FAILURE_PAGE = """<!doctype html>
 <style>
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-       background: #fef2f2; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif; color: #0f172a; }
-.card { width: min(92vw, 420px); background: #ffffff; border: 1px solid #fecaca; border-radius: 8px;
+       background: #f1f5f9; font-family: "Segoe UI", system-ui, -apple-system, "Microsoft YaHei", sans-serif;
+       color: #0f172a; padding: 16px; }
+.card { width: min(92vw, 420px); background: #ffffff; border: 1px solid #fecaca; border-radius: 10px;
         padding: 32px 28px; box-shadow: 0 10px 30px rgba(15, 23, 42, .08); text-align: center; }
 h1 { font-size: 20px; margin: 0 0 10px; color: #b91c1c; }
-p { color: #334155; font-size: 14px; margin: 0; }
-.muted { margin-top: 18px; color: #64748b; font-size: 12px; }
+p { color: #64748b; font-size: 14px; margin: 0; }
+.muted { margin-top: 18px; color: #94a3b8; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -896,6 +1088,13 @@ p { color: #334155; font-size: 14px; margin: 0; }
 
 class AuthHandler(BaseHTTPRequestHandler):
     server_version = "WebAuthFirewall/1.0"
+
+    def handle_one_request(self):
+        _REQUEST_SEMAPHORE.acquire()
+        try:
+            super().handle_one_request()
+        finally:
+            _REQUEST_SEMAPHORE.release()
 
     def log_message(self, fmt, *args):
         LOG.info("%s %s", self.client_address[0], fmt % args)
@@ -976,7 +1175,7 @@ class AuthHandler(BaseHTTPRequestHandler):
         else:
             blacklisted, remaining = record_failed_attempt(ip, family)
             if blacklisted:
-                message = "您已连续 3 次登录失败，IP 已被加入黑名单（48 小时有效），服务器所有端口（包括认证端口）将拒绝访问；请联系管理员解除或等待自动过期。"
+                message = "您已连续 3 次登录失败，IP 已被加入黑名单（%d 小时有效），服务器所有端口（包括认证端口）将拒绝访问；请联系管理员解除或等待自动过期。" % BLACKLIST_TTL_HOURS
             else:
                 message = "用户名或密码错误。5 分钟内累计 3 次失败将被加入黑名单，您还可以尝试 %d 次。" % remaining
             self._send_html(401, render_failure_page(message))
@@ -990,22 +1189,57 @@ class AuthHandler(BaseHTTPRequestHandler):
             self._send_html(403, FORBIDDEN_PAGE)
             return
         action = params.get("action", [""])[0]
+        if action == "update_ttl":
+            try:
+                wh = int(params.get("whitelist_hours", [""])[0])
+                bh = int(params.get("blacklist_hours", [""])[0])
+            except ValueError:
+                self._send_html(200, render_success_page(ip, message="有效期必须是数字。"))
+                return
+            if wh < 1 or wh > MAX_TTL_HOURS or bh < 1 or bh > MAX_TTL_HOURS:
+                self._send_html(
+                    200,
+                    render_success_page(ip, message="有效期必须为 1-%d 小时。" % MAX_TTL_HOURS),
+                )
+                return
+            set_global_ttl(wh, bh)
+            self._send_html(
+                200,
+                render_success_page(ip, message="全局有效期已更新：白名单 %d 小时，黑名单 %d 小时，现有名单已同步。" % (wh, bh)),
+            )
+            return
         raw_ip = params.get("ip", [""])[0]
         target, target_family = normalize_ip(raw_ip)
         if target is None:
             self._send_html(200, render_success_page(ip, message="无效的 IP 地址"))
             return
+        ttl_seconds = None
+        hours_raw = params.get("hours", [""])[0]
+        if hours_raw:
+            try:
+                hours = int(hours_raw)
+            except ValueError:
+                hours = 0
+            if hours < 1 or hours > MAX_TTL_HOURS:
+                self._send_html(
+                    200,
+                    render_success_page(ip, message="有效时间必须为 1-%d 小时。" % MAX_TTL_HOURS),
+                )
+                return
+            ttl_seconds = hours * 3600
         if action == "add_whitelist":
-            grant_access(target, target_family)
-            message = "已将 %s 加入白名单，有效期 48 小时。" % target
+            grant_access(target, target_family, ttl_seconds)
+            hours = ttl_seconds // 3600 if ttl_seconds else DEFAULT_TTL_HOURS
+            message = "已将 %s 加入白名单，有效期 %d 小时。" % (target, hours)
         elif action == "remove_whitelist":
             if remove_from_whitelist(target, target_family):
                 message = "已将 %s 从白名单移除。" % target
             else:
                 message = "%s 不在白名单中。" % target
         elif action == "add_blacklist":
-            revoke_access(target, target_family)
-            message = "已将 %s 加入黑名单。" % target
+            revoke_access(target, target_family, ttl_seconds)
+            hours = ttl_seconds // 3600 if ttl_seconds else DEFAULT_TTL_HOURS
+            message = "已将 %s 加入黑名单，有效期 %d 小时。" % (target, hours)
         elif action == "remove_blacklist":
             if remove_from_blacklist(target, target_family):
                 message = "已将 %s 从黑名单移除。" % target
@@ -1018,6 +1252,7 @@ class AuthHandler(BaseHTTPRequestHandler):
 
 class AuthHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
+    request_queue_size = 64
 
     def server_bind(self):
         self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -1036,7 +1271,7 @@ def build_server():
 
 def reconciler_loop():
     while True:
-        time.sleep(60)
+        time.sleep(RECONCILE_INTERVAL_SECONDS)
         try:
             reconcile()
         except Exception as exc:  # keep the thread alive
@@ -1137,11 +1372,23 @@ def main():
     ip = addr.compressed
     family = "4" if isinstance(addr, ipaddress.IPv4Address) else "6"
 
+    ttl_seconds = None
+    if len(sys.argv) >= 5:
+        try:
+            hours = int(sys.argv[4])
+        except ValueError:
+            print("invalid hours", file=sys.stderr)
+            return 2
+        if hours < 1 or hours > 720:
+            print("hours must be between 1 and 720", file=sys.stderr)
+            return 2
+        ttl_seconds = hours * 3600
+
     if action == "add":
         if kind == "whitelist":
-            auth.grant_access(ip, family)
+            auth.grant_access(ip, family, ttl_seconds)
         else:
-            auth.revoke_access(ip, family)
+            auth.revoke_access(ip, family, ttl_seconds)
     elif action == "remove":
         if kind == "whitelist":
             if not auth.remove_from_whitelist(ip, family):
@@ -1168,6 +1415,392 @@ PYEOF
     else
       warn "chattr +i failed on manage.py; file is root-only but not immutable."
     fi
+  fi
+}
+
+write_geoip_scripts() {
+  for f in geoip.py geoip_build.py geoip_update.py; do
+    if [[ -f "${INSTALL_DIR}/${f}" ]] && command -v chattr >/dev/null 2>&1; then
+      chattr -i "${INSTALL_DIR}/${f}" 2>/dev/null || true
+    fi
+  done
+  cat > "${INSTALL_DIR}/geoip.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Offline GeoIP lookup backed by the compact binary cache built by geoip_build.py."""
+
+import ipaddress
+import mmap
+import os
+import struct
+
+GEOIP_FILE = os.environ.get("GEOIP_FILE", "/etc/web-auth-firewall/geoip.dat")
+_HEADER = struct.Struct(">4sI")
+_RECORD = struct.Struct(">III")
+_mmap = None
+_count = 0
+
+
+def _open():
+    global _mmap, _count
+    if _mmap is not None:
+        return
+    try:
+        with open(GEOIP_FILE, "rb") as fh:
+            mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    except OSError:
+        return
+    if mm.size() < _HEADER.size:
+        mm.close()
+        return
+    magic, count = _HEADER.unpack_from(mm, 0)
+    if magic != b"WGFG" or count == 0:
+        mm.close()
+        return
+    _mmap = mm
+    _count = count
+
+
+def _name_at(offset):
+    if offset < 0 or offset >= len(_mmap):
+        return ""
+    end = _mmap.find(b"\0", offset)
+    if end == -1:
+        return ""
+    return _mmap[offset:end].decode("utf-8", "replace")
+
+
+def _record_at(index):
+    off = _HEADER.size + index * _RECORD.size
+    start, end, name_off = _RECORD.unpack_from(_mmap, off)
+    return start, end, _name_at(name_off)
+
+
+def is_available():
+    _open()
+    return _mmap is not None and _count > 0
+
+
+def country(ip_str):
+    _open()
+    if _mmap is None or _count == 0:
+        return None
+    try:
+        value = int(ipaddress.ip_address(ip_str.strip()))
+    except ValueError:
+        return None
+    if value > 0xFFFFFFFF:
+        return None
+    low, high = 0, _count - 1
+    while low <= high:
+        mid = (low + high) // 2
+        start, end, label = _record_at(mid)
+        if value < start:
+            high = mid - 1
+        elif value > end:
+            low = mid + 1
+        else:
+            if label in ("", "-"):
+                return None
+            return label
+    return None
+PYEOF
+  cat > "${INSTALL_DIR}/geoip_build.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Build a compact GeoIP binary cache from a CSV with low memory usage."""
+
+import csv
+import heapq
+import ipaddress
+import os
+import shutil
+import struct
+import sys
+import tempfile
+
+_HEADER = struct.Struct(">4sI")
+_RECORD = struct.Struct(">III")
+_CHUNK_ROWS = 100000
+
+
+def _line_key(line):
+    parts = line.split("\t", 2)
+    return int(parts[0]), int(parts[1])
+
+
+def _external_sort(raw_path, sorted_path, tmpdir):
+    chunk_paths = []
+    chunk = []
+    with open(raw_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            chunk.append(line)
+            if len(chunk) >= _CHUNK_ROWS:
+                chunk.sort(key=_line_key)
+                chunk_path = os.path.join(tmpdir, "chunk_%d" % len(chunk_paths))
+                with open(chunk_path, "w", encoding="utf-8") as out:
+                    out.writelines(chunk)
+                chunk_paths.append(chunk_path)
+                chunk = []
+    if chunk:
+        chunk.sort(key=_line_key)
+        chunk_path = os.path.join(tmpdir, "chunk_%d" % len(chunk_paths))
+        with open(chunk_path, "w", encoding="utf-8") as out:
+            out.writelines(chunk)
+        chunk_paths.append(chunk_path)
+    handles = [open(p, "r", encoding="utf-8") for p in chunk_paths]
+    heap = []
+    for idx, handle in enumerate(handles):
+        line = handle.readline()
+        if line:
+            heapq.heappush(heap, (_line_key(line), idx, line))
+    with open(sorted_path, "w", encoding="utf-8") as out:
+        while heap:
+            _, idx, line = heapq.heappop(heap)
+            out.write(line)
+            nxt = handles[idx].readline()
+            if nxt:
+                heapq.heappush(heap, (_line_key(nxt), idx, nxt))
+    for handle in handles:
+        handle.close()
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: geoip_build.py <input.csv> <output.dat>", file=sys.stderr)
+        return 2
+    src, dst = sys.argv[1], sys.argv[2]
+    tmpdir = tempfile.mkdtemp(prefix="geoip_build_")
+    raw_path = os.path.join(tmpdir, "raw.tsv")
+    sorted_path = os.path.join(tmpdir, "sorted.tsv")
+    try:
+        count = 0
+        sorted_ok = True
+        prev_start = -1
+        with open(src, "r", encoding="utf-8", errors="replace", newline="") as fh, \
+                open(raw_path, "w", encoding="utf-8") as raw:
+            reader = csv.reader(fh)
+            for row in reader:
+                if len(row) < 4:
+                    continue
+                code = row[2].strip()
+                if not code or code == "-":
+                    continue
+                try:
+                    start = int(ipaddress.IPv4Address(row[0]))
+                    end = int(ipaddress.IPv4Address(row[1]))
+                except ValueError:
+                    continue
+                if start < prev_start:
+                    sorted_ok = False
+                prev_start = start
+                name_parts = [p.strip() for p in row[3:5] if p.strip() and p.strip() != "-"]
+                name = ", ".join(name_parts) if name_parts else code
+                label = "%s · %s" % (code, name) if name != code else code
+                raw.write(
+                    "%d\t%d\t%s\n" % (
+                        start,
+                        end,
+                        label.replace("\t", " ").replace("\n", " "),
+                    )
+                )
+                count += 1
+        if count == 0:
+            print("no valid IP ranges found", file=sys.stderr)
+            return 1
+        if sorted_ok:
+            sorted_path = raw_path
+        else:
+            sorted_path = os.path.join(tmpdir, "sorted.tsv")
+            _external_sort(raw_path, sorted_path, tmpdir)
+        name_table = bytearray()
+        name_offsets = {}
+        table_start = _HEADER.size + count * _RECORD.size
+        with open(dst, "wb") as out:
+            out.write(_HEADER.pack(b"WGFG", count))
+            with open(sorted_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split("\t", 2)
+                    if len(parts) != 3:
+                        continue
+                    start, end = int(parts[0]), int(parts[1])
+                    label = parts[2]
+                    off = name_offsets.get(label)
+                    if off is None:
+                        off = table_start + len(name_table)
+                        name_offsets[label] = off
+                        name_table.extend(label.encode("utf-8"))
+                        name_table.append(0)
+                    out.write(_RECORD.pack(start, end, off))
+            out.write(bytes(name_table))
+        print("built %d ranges -> %s" % (count, dst))
+        return 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYEOF
+  cat > "${INSTALL_DIR}/geoip_update.py" <<'PYEOF'
+#!/usr/bin/env python3
+"""Download v2rayN-style GeoIP data and build the local GeoIP cache."""
+
+import datetime
+import gzip
+import ipaddress
+import os
+import shutil
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+import geoip_build
+
+_override = os.environ.get("GEOIP_URL", "")
+CANDIDATE_URLS = [_override] if _override else [
+    "https://download.db-ip.com/free/dbip-city-lite-%s.csv.gz" % datetime.date.today().strftime("%Y-%m"),
+    "https://github.com/Loyalsoldier/geoip/releases/latest/download/geoip.dat",
+    "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat",
+    "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/geoip.dat",
+]
+OUTPUT = os.environ.get("GEOIP_OUTPUT", "/etc/web-auth-firewall/geoip.dat")
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
+
+def _read_varint(data, pos):
+    result = 0
+    shift = 0
+    while True:
+        b = data[pos]
+        pos += 1
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return result, pos
+        shift += 7
+
+
+def _fields(data, offset, limit):
+    fields = []
+    pos = offset
+    while pos < limit:
+        key, pos = _read_varint(data, pos)
+        num = key >> 3
+        wire = key & 7
+        if wire == 0:
+            value, pos = _read_varint(data, pos)
+        elif wire == 2:
+            length, pos = _read_varint(data, pos)
+            value = data[pos:pos + length]
+            pos += length
+        else:
+            raise ValueError("unsupported protobuf wire type %d" % wire)
+        fields.append((num, wire, value))
+    return fields
+
+
+def _fetch(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    print("downloading %s" % url)
+    with urllib.request.urlopen(req, timeout=300) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        downloaded = 0
+        last_print = 0
+        while True:
+            chunk = resp.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            downloaded += len(chunk)
+            if downloaded - last_print >= 10 * 1024 * 1024 or (total and downloaded >= total):
+                if total:
+                    print("downloaded %d MB / %d MB" % (downloaded // (1024 * 1024), total // (1024 * 1024)))
+                else:
+                    print("downloaded %d MB" % (downloaded // (1024 * 1024)))
+                last_print = downloaded
+
+
+def main():
+    tmpdir = tempfile.mkdtemp(prefix="geoip_update_")
+    try:
+        dat_path = os.path.join(tmpdir, "geoip.dat")
+        last_error = None
+        for url in CANDIDATE_URLS:
+            try:
+                _fetch(url, dat_path)
+                break
+            except (urllib.error.URLError, OSError) as exc:
+                last_error = exc
+                print("download failed: %s" % exc, file=sys.stderr)
+        else:
+            print("all GeoIP download sources failed: %s" % last_error, file=sys.stderr)
+            return 1
+        with open(dat_path, "rb") as fh:
+            raw = fh.read()
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass
+        csv_path = os.path.join(tmpdir, "v2ray_geoip.csv")
+        sample = raw[:4096].decode("utf-8", "replace")
+        if (sample[:1].isdigit() or sample[:1] == '"') and "," in sample:
+            with open(csv_path, "wb") as dst:
+                dst.write(raw)
+            sys.argv = ["geoip_build.py", csv_path, OUTPUT]
+            rc = geoip_build.main()
+            if rc != 0 or not os.path.exists(OUTPUT):
+                print("CSV GeoIP source produced no usable ranges", file=sys.stderr)
+                return 1
+            return rc
+        count = 0
+        with open(csv_path, "w", encoding="utf-8") as out:
+            for num, wire, value in _fields(raw, 0, len(raw)):
+                if num != 1 or wire != 2:
+                    continue
+                code = ""
+                ranges = []
+                for fnum, fwire, fval in _fields(value, 0, len(value)):
+                    if fnum == 1 and fwire == 2:
+                        code = fval.decode("utf-8", "replace")
+                    elif fnum == 2 and fwire == 2:
+                        ip_bytes = b""
+                        prefix = 0
+                        for cnum, cwire, cval in _fields(fval, 0, len(fval)):
+                            if cnum == 1 and cwire == 2:
+                                ip_bytes = cval
+                            elif cnum == 2 and cwire == 0:
+                                prefix = cval
+                        if len(ip_bytes) == 4 and prefix <= 32:
+                            start = int.from_bytes(ip_bytes, "big")
+                            end = start + (1 << (32 - prefix)) - 1
+                            ranges.append((start, end))
+                for start, end in ranges:
+                    if code:
+                        out.write(
+                            "%s,%s,%s,%s\n" % (
+                                ipaddress.IPv4Address(start),
+                                ipaddress.IPv4Address(end),
+                                code,
+                                code,
+                            )
+                        )
+                        count += 1
+        if count == 0:
+            print("no IPv4 ranges found in GeoIP data", file=sys.stderr)
+            return 1
+        sys.argv = ["geoip_build.py", csv_path, OUTPUT]
+        return geoip_build.main()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYEOF
+  chmod 700 "${INSTALL_DIR}/geoip.py" "${INSTALL_DIR}/geoip_build.py" "${INSTALL_DIR}/geoip_update.py"
+  if command -v chattr >/dev/null 2>&1; then
+    for f in geoip.py geoip_build.py geoip_update.py; do
+      chattr +i "${INSTALL_DIR}/${f}" 2>/dev/null || true
+    done
   fi
 }
 
@@ -1234,6 +1867,8 @@ ExecStart=${PY_BIN} ${INSTALL_DIR}/auth_server.py
 Environment=AUTH_PORT=${AUTH_PORT}
 Environment=NFT_TABLE=${NFT_TABLE}
 Environment=AUTH_PATH=${AUTH_PATH}
+Environment=RECONCILE_INTERVAL_SECONDS=300
+Environment=MAX_CONCURRENT_REQUESTS=16
 Restart=on-failure
 RestartSec=3
 ProtectSystem=strict
@@ -1349,16 +1984,17 @@ print_summary() {
 uninstall() {
   say "Stopping and disabling services..."
   systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
-  systemctl disable --now nftables >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${SERVICE}.service"
   systemctl daemon-reload
 
   if command -v chattr >/dev/null 2>&1; then
-    chattr -i "${CRED_FILE}" 2>/dev/null || true
-    chattr -i "${INSTALL_DIR}/auth_server.py" 2>/dev/null || true
-    chattr -i "${INSTALL_DIR}/manage.py" 2>/dev/null || true
+    find "${INSTALL_DIR}" -type f -exec chattr -i {} + 2>/dev/null || true
   fi
-  rm -rf "${INSTALL_DIR}" "${ETC_DIR}" "${STATE_DIR}"
+  rm -rf "${INSTALL_DIR}" "${STATE_DIR}"
+
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet "${NFT_TABLE}" 2>/dev/null || true
+  fi
   rm -f "${NFT_CONF}"
   if [[ -f "${NFT_BACKUP}" ]]; then
     mv "${NFT_BACKUP}" "${NFT_CONF}"
@@ -1367,7 +2003,26 @@ uninstall() {
       nft -f "${NFT_CONF}" || warn "Could not reload the restored ruleset."
     fi
   fi
-  say "Uninstall complete."
+
+  local nft_enabled="no" ufw_active="no" fw_active="no"
+  if [[ -f "${ETC_DIR}/pre_install_state" ]]; then
+    # shellcheck disable=SC1091
+    . "${ETC_DIR}/pre_install_state"
+  fi
+  if [[ "${nft_enabled}" == "yes" ]]; then
+    systemctl enable --now nftables >/dev/null 2>&1 || true
+  else
+    systemctl disable --now nftables >/dev/null 2>&1 || true
+  fi
+  if [[ "${ufw_active}" == "yes" ]]; then
+    systemctl enable --now ufw >/dev/null 2>&1 || true
+  fi
+  if [[ "${fw_active}" == "yes" ]]; then
+    systemctl enable --now firewalld >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "${ETC_DIR}"
+  say "Uninstall complete. The system firewall state has been restored."
 }
 
 require_installed() {
@@ -1392,14 +2047,15 @@ get_server_ip() {
 }
 
 format_login_url() {
-  local ip="$1" host path
+  local ip="$1" host path port
   path="$(get_auth_path)"
+  port="$(get_auth_port)"
   if [[ -n "${ip}" && "${ip}" == *:* ]]; then
     host="[${ip}]"
   else
     host="${ip}"
   fi
-  printf 'http://%s:%s%s' "${host}" "${AUTH_PORT}" "${path}"
+  printf 'http://%s:%s%s' "${host}" "${port}" "${path}"
 }
 
 normalize_auth_path() {
@@ -1429,6 +2085,30 @@ write_auth_path_file() {
   printf '%s\n' "${AUTH_PATH}" > "${ETC_DIR}/auth_path"
   chown root:root "${ETC_DIR}/auth_path"
   chmod 600 "${ETC_DIR}/auth_path"
+}
+
+normalize_auth_port() {
+  local p="$1"
+  if [[ ! "${p}" =~ ^[0-9]+$ || "${p}" -lt 1 || "${p}" -gt 65535 ]]; then
+    warn "端口必须为 1-65535 的数字。"
+    return 1
+  fi
+  AUTH_PORT="${p}"
+}
+
+get_auth_port() {
+  if [[ -f "${ETC_DIR}/auth_port" ]]; then
+    cat "${ETC_DIR}/auth_port"
+  else
+    printf '%s' "${AUTH_PORT}"
+  fi
+}
+
+write_auth_port_file() {
+  install -d -m 700 "${ETC_DIR}"
+  printf '%s\n' "${AUTH_PORT}" > "${ETC_DIR}/auth_port"
+  chown root:root "${ETC_DIR}/auth_port"
+  chmod 600 "${ETC_DIR}/auth_port"
 }
 
 change_credentials() {
@@ -1519,6 +2199,34 @@ custom_auth_path() {
   say "新登录地址: $(format_login_url "$(get_server_ip)")"
 }
 
+custom_auth_port() {
+  local new_port
+  require_installed || return 1
+  echo "当前认证端口: $(get_auth_port)"
+  echo "当前登录地址: $(format_login_url "$(get_server_ip)")"
+  echo ""
+  read -r -p "输入新的认证端口（1-65535）: " new_port
+  normalize_auth_port "${new_port}" || return 1
+  write_auth_port_file
+  write_nft_conf
+  write_systemd_unit
+  systemctl daemon-reload
+  nft -f "${NFT_CONF}"
+  systemctl restart "${SERVICE}" >/dev/null 2>&1 || true
+  say "认证端口已更新。"
+  say "新登录地址: $(format_login_url "$(get_server_ip)")"
+}
+
+update_geoip() {
+  require_installed || return 1
+  warn "正在部署最新 GeoIP 工具..."
+  write_geoip_scripts
+  say "Updating GeoIP database (about 84MB, may take a few minutes)..."
+  python3 "${INSTALL_DIR}/geoip_update.py" || die "GeoIP 数据库更新失败。"
+  chmod 644 "${ETC_DIR}/geoip.dat"
+  say "GeoIP 数据库更新完成。"
+}
+
 manage_whitelist() {
   local action ip
   require_installed || return 1
@@ -1597,6 +2305,8 @@ show_menu() {
   echo "  7) 查看服务状态与防火墙规则"
   echo "  8) 卸载 Web 认证防火墙"
   echo "  9) 自定义登录地址"
+  echo " 10) 自定义服务端口"
+  echo " 11) 更新 GeoIP 数据库"
   echo "  0) 退出"
   echo "====================================================="
 }
@@ -1605,7 +2315,7 @@ menu() {
   local choice ip
   while true; do
     show_menu
-    read -r -p "请选择操作 [0-9]: " choice
+    read -r -p "请选择操作 [0-11]: " choice
     case "${choice}" in
       1) install_web_auth ;;
       2) if require_installed; then python3 "${INSTALL_DIR}/manage.py" list whitelist; fi ;;
@@ -1616,6 +2326,8 @@ menu() {
       7) if require_installed; then systemctl status "${SERVICE}" --no-pager || true; echo ""; nft list table inet "${NFT_TABLE}" || true; fi ;;
       8) read -r -p "确定要卸载吗？输入 yes 确认: " confirm; if [[ "${confirm}" == "yes" ]]; then uninstall; fi ;;
       9) custom_auth_path ;;
+      10) custom_auth_port ;;
+      11) update_geoip ;;
       0|q|Q) say "退出管理面板。"; exit 0 ;;
       *) warn "无效选项，请重新输入。" ;;
     esac
@@ -1628,12 +2340,15 @@ menu() {
 install_web_auth() {
   ensure_tools
   backup_existing_ruleset
+  save_pre_install_state
   stop_conflicting_firewalls
   install -d -m 755 "${INSTALL_DIR}"
   write_credentials
   write_auth_path_file
+  write_auth_port_file
   write_auth_server
   write_manage_script
+  write_geoip_scripts
   write_nft_conf
   write_systemd_unit
   write_state_file
@@ -1650,6 +2365,7 @@ main() {
     install) install_web_auth; exit 0 ;;
     uninstall) uninstall; exit 0 ;;
     change_credentials) change_credentials; exit 0 ;;
+    update_geoip) update_geoip; exit 0 ;;
     *) menu ;;
   esac
 }
