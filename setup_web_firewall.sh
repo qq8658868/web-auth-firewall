@@ -920,10 +920,14 @@ h1 { font-size: 22px; margin: 0 0 6px; color: #0f172a; }
 .listbox { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }
 .listhead { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
 .listhead h3 { font-size: 12px; margin: 0; color: #334155; }
+.listactions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ttlinline { display: flex; align-items: center; gap: 4px; }
 .ttlinline input { width: 64px; height: 28px; padding: 0 6px; border: 1px solid #cbd5e1; border-radius: 6px;
                    background: #ffffff; color: #0f172a; font-size: 12px; }
 .ttlinline button { height: 28px; }
+.btn { display: inline-block; padding: 6px 12px; border-radius: 6px; font-size: 12px; text-decoration: none;
+       background: #ffffff; color: #334155; border: 1px solid #cbd5e1; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: #f1f5f9; }
 .iprow { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px dashed #e2e8f0; flex-wrap: nowrap; }
 .iprow:last-child { border-bottom: 0; }
 .ipaddr { font-family: Consolas, monospace; font-size: 14px; color: #0f172a; flex: 1 1 auto; min-width: 0;
@@ -987,24 +991,38 @@ button.add { background: #0f766e; color: #ffffff; }
       <div class="listbox">
         <div class="listhead">
           <h3>白名单 IP（__WHITELIST_TTL__ 小时有效）</h3>
-          <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
-            <input type="hidden" name="action" value="update_ttl">
-            <input type="hidden" name="blacklist_hours" value="__BLACKLIST_TTL__">
-            <input name="whitelist_hours" type="number" min="1" max="720" value="__WHITELIST_TTL__" title="白名单有效小时数" required>
-            <button type="submit" class="small add">保存</button>
-          </form>
+          <div class="listactions">
+            <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+              <input type="hidden" name="action" value="update_ttl">
+              <input type="hidden" name="blacklist_hours" value="__BLACKLIST_TTL__">
+              <input name="whitelist_hours" type="number" min="1" max="720" value="__WHITELIST_TTL__" title="白名单有效小时数" required>
+              <button type="submit" class="small add">保存</button>
+            </form>
+            <a class="btn" href="__MANAGE_ACTION__">刷新</a>
+            <form method="post" action="__MANAGE_ACTION__" onsubmit="return confirm('确定清空全部白名单吗？清空后您需要重新登录。');">
+              <input type="hidden" name="action" value="clear_whitelist">
+              <button type="submit" class="small danger">清空</button>
+            </form>
+          </div>
         </div>
         __WHITELIST_ROWS__
       </div>
       <div class="listbox">
         <div class="listhead">
           <h3>黑名单 IP（__BLACKLIST_TTL__ 小时有效）</h3>
-          <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
-            <input type="hidden" name="action" value="update_ttl">
-            <input type="hidden" name="whitelist_hours" value="__WHITELIST_TTL__">
-            <input name="blacklist_hours" type="number" min="1" max="720" value="__BLACKLIST_TTL__" title="黑名单有效小时数" required>
-            <button type="submit" class="small add">保存</button>
-          </form>
+          <div class="listactions">
+            <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+              <input type="hidden" name="action" value="update_ttl">
+              <input type="hidden" name="whitelist_hours" value="__WHITELIST_TTL__">
+              <input name="blacklist_hours" type="number" min="1" max="720" value="__BLACKLIST_TTL__" title="黑名单有效小时数" required>
+              <button type="submit" class="small add">保存</button>
+            </form>
+            <a class="btn" href="__MANAGE_ACTION__">刷新</a>
+            <form method="post" action="__MANAGE_ACTION__" onsubmit="return confirm('确定清空全部黑名单吗？');">
+              <input type="hidden" name="action" value="clear_blacklist">
+              <button type="submit" class="small danger">清空</button>
+            </form>
+          </div>
         </div>
         __BLACKLIST_ROWS__
       </div>
@@ -1207,6 +1225,23 @@ class AuthHandler(BaseHTTPRequestHandler):
                 200,
                 render_success_page(ip, message="全局有效期已更新：白名单 %d 小时，黑名单 %d 小时，现有名单已同步。" % (wh, bh)),
             )
+            return
+        if action in ("clear_whitelist", "clear_blacklist"):
+            kind = "whitelist" if action == "clear_whitelist" else "blacklist"
+            cleared_self = ip in STATE[kind][family]
+            with STATE_LOCK:
+                for fam in FAMILIES:
+                    setname = set_name(kind, fam)
+                    if STATE[kind][fam]:
+                        nft_ok("flush", "set", "inet", NFT_TABLE, setname)
+                    STATE[kind][fam] = {}
+                save_state(STATE)
+            label = "白名单" if kind == "whitelist" else "黑名单"
+            message = "已清空全部%s。" % label
+            if cleared_self and kind == "whitelist":
+                message += " 您的 IP 也已从白名单移除，请重新登录以恢复访问。"
+            LOG.info("%s cleared via web", label)
+            self._send_html(200, render_success_page(ip, message=message))
             return
         raw_ip = params.get("ip", [""])[0]
         target, target_family = normalize_ip(raw_ip)
