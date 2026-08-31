@@ -1988,7 +1988,7 @@ uninstall() {
   systemctl daemon-reload
 
   if command -v chattr >/dev/null 2>&1; then
-    find "${INSTALL_DIR}" -type f -exec chattr -i {} + 2>/dev/null || true
+    find "${INSTALL_DIR}" "${ETC_DIR}" "${STATE_DIR}" -type f -exec chattr -i {} + 2>/dev/null || true
   fi
   rm -rf "${INSTALL_DIR}" "${STATE_DIR}"
 
