@@ -13,9 +13,16 @@
 #   sudo ./setup_web_firewall.sh --allow-icmp
 #   sudo ./setup_web_firewall.sh --uninstall
 #
+#
+# Version history:
+#   1.1.3 (2026-09):
+#     - fix: stream GeoIP download/decompression to avoid OOM kill on low-RAM VPS
+#     - feat: GeoIP locations shown in Chinese (continents / countries / CN regions)
+#     - feat: menu option 7 shows current login credentials (username / password state)
+#
 set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.3"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
@@ -765,13 +772,69 @@ COUNTRY_NAMES = {
 }
 
 
+CONTINENT_NAMES = {
+    "AF": "非洲",
+    "AS": "亚洲",
+    "EU": "欧洲",
+    "NA": "北美洲",
+    "OC": "大洋洲",
+    "SA": "南美洲",
+    "AN": "南极洲",
+}
+
+
+CN_REGION_NAMES = {
+    "Anhui": "安徽", "Beijing": "北京", "Chongqing": "重庆", "Fujian": "福建",
+    "Gansu": "甘肃", "Guangdong": "广东", "Guangxi": "广西", "Guizhou": "贵州",
+    "Hainan": "海南", "Hebei": "河北", "Heilongjiang": "黑龙江", "Henan": "河南",
+    "Hubei": "湖北", "Hunan": "湖南", "Inner Mongolia": "内蒙古", "Nei Mongol": "内蒙古",
+    "Jiangsu": "江苏", "Jiangxi": "江西", "Jilin": "吉林", "Liaoning": "辽宁",
+    "Ningxia": "宁夏", "Qinghai": "青海", "Shaanxi": "陕西", "Shandong": "山东",
+    "Shanghai": "上海", "Shanxi": "山西", "Sichuan": "四川", "Tianjin": "天津",
+    "Tibet": "西藏", "Xizang": "西藏", "Xinjiang": "新疆", "Yunnan": "云南",
+    "Zhejiang": "浙江", "Hong Kong": "香港", "Macau": "澳门", "Macao": "澳门",
+    "Taiwan": "台湾",
+}
+
+
+def _translate_geo_label(raw):
+    """Translate stored GeoIP labels into Chinese for display.
+
+    Handles the formats produced by the bundled builders:
+      * "CN"              (v2ray .dat source: plain country code)
+      * "AS · CN, Yunnan" (db-ip CSV source: continent · code, region)
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+
+    def _tr(token):
+        token = token.strip()
+        if token in COUNTRY_NAMES:
+            return COUNTRY_NAMES[token]
+        if token in CONTINENT_NAMES:
+            return CONTINENT_NAMES[token]
+        if token in CN_REGION_NAMES:
+            return CN_REGION_NAMES[token]
+        return token
+
+    if "·" in raw:
+        head, _, tail = raw.partition("·")
+        head = _tr(head)
+        tail = ", ".join(t for t in (_tr(x) for x in tail.split(",")) if t)
+        if head and tail:
+            return head + " · " + tail
+        return head or tail
+    return _tr(raw)
+
+
 def geo_label(ip):
     if geoip is None or not geoip.is_available():
         return '<span class="geo unknown">未知</span>'
     info = geoip.country(ip)
     if not info:
         return '<span class="geo unknown">未知</span>'
-    label = COUNTRY_NAMES.get(info, info)
+    label = _translate_geo_label(info)
     return '<span class="geo">%s</span>' % escape(label)
 
 
@@ -1105,7 +1168,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.0"
+    server_version = "WebAuthFirewall/1.1.3"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -1769,23 +1832,30 @@ def main():
         else:
             print("all GeoIP download sources failed: %s" % last_error, file=sys.stderr)
             return 1
-        with open(dat_path, "rb") as fh:
-            raw = fh.read()
-        try:
-            raw = gzip.decompress(raw)
-        except OSError:
-            pass
         csv_path = os.path.join(tmpdir, "v2ray_geoip.csv")
-        sample = raw[:4096].decode("utf-8", "replace")
+        with open(dat_path, "rb") as fh:
+            _head = fh.read(2)
+        _is_gzip = _head == b"\x1f\x8b"
+        _opener = gzip.open if _is_gzip else open
+
+        # Peek at the first 4 KB to detect CSV vs v2ray .dat without loading
+        # the whole download into memory (fixes OOM kill on low-RAM VPS).
+        with _opener(dat_path, "rb") as fh:
+            sample = fh.read(4096).decode("utf-8", "replace")
         if (sample[:1].isdigit() or sample[:1] == '"') and "," in sample:
-            with open(csv_path, "wb") as dst:
-                dst.write(raw)
+            # CSV source: stream (de)compression straight to disk.
+            with _opener(dat_path, "rb") as src, open(csv_path, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
             sys.argv = ["geoip_build.py", csv_path, OUTPUT]
             rc = geoip_build.main()
             if rc != 0 or not os.path.exists(OUTPUT):
                 print("CSV GeoIP source produced no usable ranges", file=sys.stderr)
                 return 1
             return rc
+
+        # v2ray .dat (protobuf): parsed in memory, but far smaller than CSV.
+        with open(dat_path, "rb") as fh:
+            raw = fh.read()
         count = 0
         with open(csv_path, "w", encoding="utf-8") as out:
             for num, wire, value in _fields(raw, 0, len(raw)):
@@ -2211,6 +2281,30 @@ PYEOF
   say "新密码: 已设置（不在终端回显）"
 }
 
+show_credentials() {
+  require_installed || return 1
+  local user hash default_hash
+  if [[ ! -f "${CRED_FILE}" ]]; then
+    warn "未找到凭据文件：${CRED_FILE}"
+    return 1
+  fi
+  user="$(sed -n '1p' "${CRED_FILE}")"
+  hash="$(sed -n '2p' "${CRED_FILE}")"
+  default_hash="$(printf '%s' "${AUTH_PASSWORD}" | sha256sum | cut -d' ' -f1)"
+  echo "================ 当前登录凭据 ================"
+  echo "  登录用户名 : ${user:-（空）}"
+  if [[ -z "${hash}" ]]; then
+    echo "  登录密码   : 未知（凭据文件中没有密码哈希）"
+  elif [[ "${hash}" == "${default_hash}" ]]; then
+    echo "  登录密码   : ${AUTH_PASSWORD}（当前为默认密码）"
+  else
+    echo "  登录密码   : 已修改（非默认密码；出于安全只保存 SHA-256，无法显示明文）"
+  fi
+  echo "  密码哈希   : ${hash:-（无）}"
+  echo "  登录地址   : $(format_login_url "$(get_server_ip)")"
+  echo "=============================================="
+}
+
 custom_auth_path() {
   local new_path
   require_installed || return 1
@@ -2337,11 +2431,12 @@ show_menu() {
   echo "  4) 手动管理白名单（添加 / 删除）"
   echo "  5) 手动管理黑名单（添加 / 删除）"
   echo "  6) 重置 / 修改用户名和密码"
-  echo "  7) 查看服务状态与防火墙规则"
-  echo "  8) 卸载 Web 认证防火墙"
-  echo "  9) 自定义登录地址"
-  echo " 10) 自定义服务端口"
-  echo " 11) 更新 GeoIP 数据库"
+  echo "  7) 显示当前登录账户 / 密码状态"
+  echo "  8) 查看服务状态与防火墙规则"
+  echo "  9) 卸载 Web 认证防火墙"
+  echo " 10) 自定义登录地址"
+  echo " 11) 自定义服务端口"
+  echo " 12) 更新 GeoIP 数据库"
   echo "  0) 退出"
   echo "====================================================="
 }
@@ -2350,7 +2445,7 @@ menu() {
   local choice ip
   while true; do
     show_menu
-    read -r -p "请选择操作 [0-11]: " choice
+    read -r -p "请选择操作 [0-12]: " choice
     case "${choice}" in
       1) install_web_auth ;;
       2) if require_installed; then python3 "${INSTALL_DIR}/manage.py" list whitelist; fi ;;
@@ -2358,11 +2453,12 @@ menu() {
       4) manage_whitelist ;;
       5) manage_blacklist ;;
       6) change_credentials ;;
-      7) if require_installed; then systemctl status "${SERVICE}" --no-pager || true; echo ""; nft list table inet "${NFT_TABLE}" || true; fi ;;
-      8) read -r -p "确定要卸载吗？输入 yes 确认: " confirm; if [[ "${confirm}" == "yes" ]]; then uninstall; fi ;;
-      9) custom_auth_path ;;
-      10) custom_auth_port ;;
-      11) update_geoip ;;
+      7) show_credentials ;;
+      8) if require_installed; then systemctl status "${SERVICE}" --no-pager || true; echo ""; nft list table inet "${NFT_TABLE}" || true; fi ;;
+      9) read -r -p "确定要卸载吗？输入 yes 确认: " confirm; if [[ "${confirm}" == "yes" ]]; then uninstall; fi ;;
+      10) custom_auth_path ;;
+      11) custom_auth_port ;;
+      12) update_geoip ;;
       0|q|Q) say "退出管理面板。"; exit 0 ;;
       *) warn "无效选项，请重新输入。" ;;
     esac
