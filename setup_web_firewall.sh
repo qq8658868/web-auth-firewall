@@ -15,6 +15,8 @@
 #
 #
 # Version history:
+#   1.1.5 (2026-09):
+#     - fix: correctly parse db-ip city-lite CSV columns so city names are kept
 #   1.1.4 (2026-09):
 #     - feat: GeoIP city/region names translated to Chinese (major cities worldwide)
 #     - feat: restart auth service automatically after GeoIP database update
@@ -25,7 +27,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.4"
+VERSION="1.1.5"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
@@ -378,7 +380,7 @@ if AUTH_PATH != "/":
 LOGIN_ACTION = AUTH_PATH if AUTH_PATH != "/" else "/"
 MANAGE_ACTION = AUTH_PATH + "/manage" if AUTH_PATH != "/" else "/manage"
 LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
-SCRIPT_VERSION = "1.1.4"
+SCRIPT_VERSION = "1.1.5"
 
 # Immutable defaults. The service refuses to start if the on-disk
 # credentials file does not match these exact values.
@@ -1359,7 +1361,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.1.4"
+    server_version = "WebAuthFirewall/1.1.5"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -1870,9 +1872,6 @@ def main():
             for row in reader:
                 if len(row) < 4:
                     continue
-                code = row[2].strip()
-                if not code or code == "-":
-                    continue
                 try:
                     start = int(ipaddress.IPv4Address(row[0]))
                     end = int(ipaddress.IPv4Address(row[1]))
@@ -1881,9 +1880,29 @@ def main():
                 if start < prev_start:
                     sorted_ok = False
                 prev_start = start
-                name_parts = [p.strip() for p in row[3:5] if p.strip() and p.strip() != "-"]
-                name = ", ".join(name_parts) if name_parts else code
-                label = "%s · %s" % (code, name) if name != code else code
+                if len(row) >= 6:
+                    # db-ip city-lite format:
+                    # start,end,continent,country_code,state_prov,city,lat,lon
+                    continent = row[2].strip()
+                    country = row[3].strip()
+                    if not country or country in ("-", "ZZ"):
+                        continue
+                    parts = [
+                        p.strip() for p in (row[4], row[5])
+                        if p and p.strip() and p.strip() != "-"
+                    ]
+                    name = ", ".join(parts)
+                    head = continent if continent and continent != "-" else country
+                    label = "%s · %s" % (head, country)
+                    if name:
+                        label += ", " + name
+                else:
+                    code = row[2].strip()
+                    if not code or code == "-":
+                        continue
+                    name_parts = [p.strip() for p in row[3:5] if p.strip() and p.strip() != "-"]
+                    name = ", ".join(name_parts) if name_parts else code
+                    label = "%s · %s" % (code, name) if name != code else code
                 raw.write(
                     "%d\t%d\t%s\n" % (
                         start,
