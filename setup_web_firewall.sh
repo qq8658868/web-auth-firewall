@@ -15,6 +15,9 @@
 #
 #
 # Version history:
+#   1.1.4 (2026-09):
+#     - feat: GeoIP city/region names translated to Chinese (major cities worldwide)
+#     - feat: restart auth service automatically after GeoIP database update
 #   1.1.3 (2026-09):
 #     - fix: stream GeoIP download/decompression to avoid OOM kill on low-RAM VPS
 #     - feat: GeoIP locations shown in Chinese (continents / countries / CN regions)
@@ -22,7 +25,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.3"
+VERSION="1.1.4"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
@@ -375,6 +378,7 @@ if AUTH_PATH != "/":
 LOGIN_ACTION = AUTH_PATH if AUTH_PATH != "/" else "/"
 MANAGE_ACTION = AUTH_PATH + "/manage" if AUTH_PATH != "/" else "/manage"
 LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
+SCRIPT_VERSION = "1.1.4"
 
 # Immutable defaults. The service refuses to start if the on-disk
 # credentials file does not match these exact values.
@@ -797,6 +801,181 @@ CN_REGION_NAMES = {
 }
 
 
+CITY_NAMES = {
+    # 中国主要城市
+    "Beijing": "北京", "Shanghai": "上海", "Tianjin": "天津", "Chongqing": "重庆",
+    "Guangzhou": "广州", "Shenzhen": "深圳", "Chengdu": "成都", "Hangzhou": "杭州",
+    "Wuhan": "武汉", "Nanjing": "南京", "Xi'an": "西安", "Zhengzhou": "郑州",
+    "Changsha": "长沙", "Shenyang": "沈阳", "Harbin": "哈尔滨", "Changchun": "长春",
+    "Jinan": "济南", "Qingdao": "青岛", "Dalian": "大连", "Xiamen": "厦门",
+    "Fuzhou": "福州", "Hefei": "合肥", "Nanchang": "南昌", "Kunming": "昆明",
+    "Guiyang": "贵阳", "Nanning": "南宁", "Haikou": "海口", "Sanya": "三亚",
+    "Lanzhou": "兰州", "Xining": "西宁", "Yinchuan": "银川", "Urumqi": "乌鲁木齐",
+    "Hohhot": "呼和浩特", "Taiyuan": "太原", "Shijiazhuang": "石家庄",
+    "Suzhou": "苏州", "Wuxi": "无锡", "Ningbo": "宁波", "Wenzhou": "温州",
+    "Dongguan": "东莞", "Foshan": "佛山", "Zhuhai": "珠海", "Zhongshan": "中山",
+    "Huizhou": "惠州", "Luoyang": "洛阳", "Guilin": "桂林", "Liuzhou": "柳州",
+    "Quanzhou": "泉州", "Zhangzhou": "漳州", "Jinhua": "金华", "Shaoxing": "绍兴",
+    "Jiaxing": "嘉兴", "Taizhou": "台州", "Yangzhou": "扬州", "Xuzhou": "徐州",
+    "Changzhou": "常州", "Nantong": "南通", "Yantai": "烟台", "Weifang": "潍坊",
+    "Tangshan": "唐山", "Baoding": "保定", "Langfang": "廊坊", "Cangzhou": "沧州",
+    "Handan": "邯郸", "Xiangyang": "襄阳", "Yichang": "宜昌", "Jingzhou": "荆州",
+    "Zhuzhou": "株洲", "Xiangtan": "湘潭", "Hengyang": "衡阳", "Mianyang": "绵阳",
+    "Luzhou": "泸州", "Deyang": "德阳", "Zunyi": "遵义", "Liupanshui": "六盘水",
+    "Baotou": "包头", "Ordos": "鄂尔多斯", "Hulunbuir": "呼伦贝尔",
+    "Lhasa": "拉萨", "Kashgar": "喀什", "Ili": "伊犁", "Karamay": "克拉玛依",
+    "Hong Kong": "香港", "Macau": "澳门", "Macao": "澳门", "Taipei": "台北",
+    "Kaohsiung": "高雄", "Taichung": "台中", "Tainan": "台南", "Hsinchu": "新竹",
+    "Taoyuan": "桃园", "Keelung": "基隆",
+    # 亚洲主要城市
+    "Tokyo": "东京", "Osaka": "大阪", "Yokohama": "横滨", "Nagoya": "名古屋",
+    "Sapporo": "札幌", "Fukuoka": "福冈", "Kyoto": "京都", "Kobe": "神户",
+    "Kawasaki": "川崎", "Saitama": "埼玉", "Hiroshima": "广岛", "Sendai": "仙台",
+    "Seoul": "首尔", "Busan": "釜山", "Incheon": "仁川", "Daegu": "大邱",
+    "Daejeon": "大田", "Gwangju": "光州", "Suwon": "水原", "Ulsan": "蔚山",
+    "Singapore": "新加坡", "Kuala Lumpur": "吉隆坡", "Penang": "槟城",
+    "George Town": "乔治市", "Johor Bahru": "新山", "Ipoh": "怡保",
+    "Bangkok": "曼谷", "Chiang Mai": "清迈", "Phuket": "普吉", "Pattaya": "芭堤雅",
+    "Manila": "马尼拉", "Cebu": "宿务", "Davao": "达沃", "Quezon City": "奎松市",
+    "Jakarta": "雅加达", "Surabaya": "泗水", "Bandung": "万隆", "Medan": "棉兰",
+    "Denpasar": "登巴萨", "Bali": "巴厘岛", "Yogyakarta": "日惹",
+    "Hanoi": "河内", "Ho Chi Minh City": "胡志明市", "Da Nang": "岘港",
+    "Can Tho": "芹苴", "Phnom Penh": "金边", "Vientiane": "万象",
+    "Yangon": "仰光", "Mandalay": "曼德勒", "Dhaka": "达卡", "Chittagong": "吉大港",
+    "Colombo": "科伦坡", "Kathmandu": "加德满都", "Thimphu": "廷布",
+    "New Delhi": "新德里", "Mumbai": "孟买", "Bengaluru": "班加罗尔",
+    "Bangalore": "班加罗尔", "Chennai": "金奈", "Kolkata": "加尔各答",
+    "Hyderabad": "海得拉巴", "Pune": "浦那", "Ahmedabad": "艾哈迈达巴德",
+    "Karachi": "卡拉奇", "Lahore": "拉合尔", "Islamabad": "伊斯兰堡",
+    "Dubai": "迪拜", "Abu Dhabi": "阿布扎比", "Sharjah": "沙迦", "Doha": "多哈",
+    "Riyadh": "利雅得", "Jeddah": "吉达", "Mecca": "麦加", "Medina": "麦地那",
+    "Kuwait City": "科威特城", "Muscat": "马斯喀特", "Manama": "麦纳麦",
+    "Tel Aviv": "特拉维夫", "Jerusalem": "耶路撒冷", "Amman": "安曼", "Beirut": "贝鲁特",
+    "Baghdad": "巴格达", "Tehran": "德黑兰", "Mashhad": "马什哈德",
+    "Istanbul": "伊斯坦布尔", "Ankara": "安卡拉", "Izmir": "伊兹密尔",
+    "Antalya": "安塔利亚", "Bursa": "布尔萨", "Tashkent": "塔什干",
+    "Almaty": "阿拉木图", "Astana": "阿斯塔纳", "Nur-Sultan": "努尔苏丹",
+    "Bishkek": "比什凯克", "Dushanbe": "杜尚别", "Ashgabat": "阿什哈巴德",
+    "Baku": "巴库", "Tbilisi": "第比利斯", "Yerevan": "埃里温",
+    # 欧洲主要城市
+    "London": "伦敦", "Manchester": "曼彻斯特", "Birmingham": "伯明翰",
+    "Glasgow": "格拉斯哥", "Edinburgh": "爱丁堡", "Liverpool": "利物浦",
+    "Leeds": "利兹", "Bristol": "布里斯托尔", "Sheffield": "谢菲尔德",
+    "Newcastle": "纽卡斯尔", "Nottingham": "诺丁汉", "Cardiff": "加的夫",
+    "Belfast": "贝尔法斯特", "Dublin": "都柏林", "Cork": "科克",
+    "Paris": "巴黎", "Marseille": "马赛", "Lyon": "里昂", "Nice": "尼斯",
+    "Toulouse": "图卢兹", "Bordeaux": "波尔多", "Lille": "里尔", "Strasbourg": "斯特拉斯堡",
+    "Nantes": "南特", "Montpellier": "蒙彼利埃", "Rennes": "雷恩",
+    "Berlin": "柏林", "Munich": "慕尼黑", "Hamburg": "汉堡", "Frankfurt": "法兰克福",
+    "Cologne": "科隆", "Stuttgart": "斯图加特", "Dusseldorf": "杜塞尔多夫",
+    "Dresden": "德累斯顿", "Leipzig": "莱比锡", "Nuremberg": "纽伦堡",
+    "Dortmund": "多特蒙德", "Essen": "埃森", "Bremen": "不来梅", "Hannover": "汉诺威",
+    "Amsterdam": "阿姆斯特丹", "Rotterdam": "鹿特丹", "The Hague": "海牙",
+    "Utrecht": "乌得勒支", "Eindhoven": "埃因霍温", "Brussels": "布鲁塞尔",
+    "Antwerp": "安特卫普", "Ghent": "根特", "Charleroi": "沙勒罗瓦",
+    "Vienna": "维也纳", "Graz": "格拉茨", "Linz": "林茨", "Salzburg": "萨尔茨堡",
+    "Zurich": "苏黎世", "Geneva": "日内瓦", "Basel": "巴塞尔", "Bern": "伯尔尼",
+    "Lausanne": "洛桑", "Lucerne": "卢塞恩", "Rome": "罗马", "Milan": "米兰",
+    "Naples": "那不勒斯", "Turin": "都灵", "Venice": "威尼斯", "Florence": "佛罗伦萨",
+    "Bologna": "博洛尼亚", "Genoa": "热那亚", "Palermo": "巴勒莫", "Catania": "卡塔尼亚",
+    "Bari": "巴里", "Verona": "维罗纳", "Madrid": "马德里", "Barcelona": "巴塞罗那",
+    "Valencia": "巴伦西亚", "Seville": "塞维利亚", "Zaragoza": "萨拉戈萨",
+    "Malaga": "马拉加", "Bilbao": "毕尔巴鄂", "Alicante": "阿利坎特",
+    "Palma": "帕尔马", "Lisbon": "里斯本", "Porto": "波尔图", "Braga": "布拉加",
+    "Athens": "雅典", "Thessaloniki": "塞萨洛尼基", "Patras": "帕特雷",
+    "Stockholm": "斯德哥尔摩", "Gothenburg": "哥德堡", "Malmo": "马尔默",
+    "Uppsala": "乌普萨拉", "Oslo": "奥斯陆", "Bergen": "卑尔根", "Trondheim": "特隆赫姆",
+    "Stavanger": "斯塔万格", "Copenhagen": "哥本哈根", "Aarhus": "奥胡斯",
+    "Odense": "欧登塞", "Helsinki": "赫尔辛基", "Espoo": "埃斯波", "Tampere": "坦佩雷",
+    "Turku": "图尔库", "Oulu": "奥卢", "Reykjavik": "雷克雅未克",
+    "Warsaw": "华沙", "Krakow": "克拉科夫", "Wroclaw": "弗罗茨瓦夫",
+    "Gdansk": "格但斯克", "Poznan": "波兹南", "Lodz": "罗兹", "Szczecin": "什切青",
+    "Prague": "布拉格", "Brno": "布尔诺", "Ostrava": "俄斯特拉发", "Plzen": "比尔森",
+    "Budapest": "布达佩斯", "Debrecen": "德布勒森", "Szeged": "塞格德",
+    "Bucharest": "布加勒斯特", "Cluj-Napoca": "克卢日-纳波卡", "Cluj": "克卢日",
+    "Timisoara": "蒂米什瓦拉", "Iasi": "雅西", "Constanta": "康斯坦察",
+    "Sofia": "索非亚", "Plovdiv": "普罗夫迪夫", "Varna": "瓦尔纳", "Burgas": "布尔加斯",
+    "Belgrade": "贝尔格莱德", "Novi Sad": "诺维萨德", "Nis": "尼什",
+    "Zagreb": "萨格勒布", "Split": "斯普利特", "Rijeka": "里耶卡",
+    "Ljubljana": "卢布尔雅那", "Maribor": "马里博尔", "Sarajevo": "萨拉热窝",
+    "Skopje": "斯科普里", "Tirana": "地拉那", "Podgorica": "波德戈里察",
+    "Bratislava": "布拉迪斯拉发", "Kosice": "科希策", "Kyiv": "基辅",
+    "Kiev": "基辅", "Kharkiv": "哈尔科夫", "Odesa": "敖德萨", "Odessa": "敖德萨",
+    "Lviv": "利沃夫", "Dnipro": "第聂伯罗", "Donetsk": "顿涅茨克",
+    "Minsk": "明斯克", "Gomel": "戈梅利", "Vilnius": "维尔纽斯", "Kaunas": "考纳斯",
+    "Klaipeda": "克莱佩达", "Riga": "里加", "Tallinn": "塔林", "Tartu": "塔尔图",
+    "Moscow": "莫斯科", "Saint Petersburg": "圣彼得堡", "St Petersburg": "圣彼得堡",
+    "Novosibirsk": "新西伯利亚", "Yekaterinburg": "叶卡捷琳堡", "Kazan": "喀山",
+    "Nizhny Novgorod": "下诺夫哥罗德", "Samara": "萨马拉", "Omsk": "鄂木斯克",
+    "Chelyabinsk": "车里雅宾斯克", "Rostov-on-Don": "顿河畔罗斯托夫",
+    "Ufa": "乌法", "Krasnodar": "克拉斯诺达尔", "Perm": "彼尔姆",
+    "Voronezh": "沃罗涅日", "Volgograd": "伏尔加格勒",
+    # 北美洲主要城市
+    "New York": "纽约", "Los Angeles": "洛杉矶", "Chicago": "芝加哥",
+    "Houston": "休斯顿", "Phoenix": "凤凰城", "Philadelphia": "费城",
+    "San Antonio": "圣安东尼奥", "San Diego": "圣迭戈", "Dallas": "达拉斯",
+    "San Jose": "圣何塞", "Austin": "奥斯汀", "Jacksonville": "杰克逊维尔",
+    "Fort Worth": "沃斯堡", "Columbus": "哥伦布", "Charlotte": "夏洛特",
+    "San Francisco": "旧金山", "Indianapolis": "印第安纳波利斯", "Seattle": "西雅图",
+    "Denver": "丹佛", "Washington": "华盛顿", "Boston": "波士顿",
+    "El Paso": "埃尔帕索", "Nashville": "纳什维尔", "Detroit": "底特律",
+    "Portland": "波特兰", "Las Vegas": "拉斯维加斯", "Memphis": "孟菲斯",
+    "Louisville": "路易斯维尔", "Baltimore": "巴尔的摩", "Milwaukee": "密尔沃基",
+    "Albuquerque": "阿尔伯克基", "Tucson": "图森", "Miami": "迈阿密",
+    "Sacramento": "萨克拉门托", "Atlanta": "亚特兰大", "Kansas City": "堪萨斯城",
+    "Omaha": "奥马哈", "Raleigh": "罗利", "Oakland": "奥克兰",
+    "Minneapolis": "明尼阿波利斯", "Tampa": "坦帕", "Pittsburgh": "匹兹堡",
+    "Cincinnati": "辛辛那提", "Cleveland": "克利夫兰", "St Louis": "圣路易斯",
+    "Orlando": "奥兰多", "New Orleans": "新奥尔良", "Salt Lake City": "盐湖城",
+    "Toronto": "多伦多", "Montreal": "蒙特利尔", "Vancouver": "温哥华",
+    "Calgary": "卡尔加里", "Edmonton": "埃德蒙顿", "Ottawa": "渥太华",
+    "Winnipeg": "温尼伯", "Quebec City": "魁北克市", "Halifax": "哈利法克斯",
+    "Hamilton": "哈密尔顿", "Kitchener": "基奇纳", "London (Ontario)": "伦敦（安大略）",
+    "Mexico City": "墨西哥城", "Guadalajara": "瓜达拉哈拉", "Monterrey": "蒙特雷",
+    "Cancun": "坎昆", "Tijuana": "蒂华纳", "Puebla": "普埃布拉",
+    "Havana": "哈瓦那", "Santo Domingo": "圣多明各", "San Juan": "圣胡安",
+    "Kingston": "金斯敦", "Port-au-Prince": "太子港", "Panama City": "巴拿马城",
+    "San Jose (Costa Rica)": "圣何塞", "Guatemala City": "危地马拉城",
+    "Tegucigalpa": "特古西加尔巴", "Managua": "马那瓜", "San Salvador": "圣萨尔瓦多",
+    # 南美洲主要城市
+    "Sao Paulo": "圣保罗", "Rio de Janeiro": "里约热内卢", "Brasilia": "巴西利亚",
+    "Salvador": "萨尔瓦多", "Fortaleza": "福塔莱萨", "Belo Horizonte": "贝洛奥里藏特",
+    "Recife": "累西腓", "Porto Alegre": "阿雷格里港", "Curitiba": "库里蒂巴",
+    "Manaus": "马瑙斯", "Buenos Aires": "布宜诺斯艾利斯", "Cordoba": "科尔多瓦",
+    "Rosario": "罗萨里奥", "Mendoza": "门多萨", "La Plata": "拉普拉塔",
+    "Santiago": "圣地亚哥", "Valparaiso": "瓦尔帕莱索", "Concepcion": "康塞普西翁",
+    "Lima": "利马", "Arequipa": "阿雷基帕", "Cusco": "库斯科",
+    "Bogota": "波哥大", "Medellin": "麦德林", "Cali": "卡利", "Barranquilla": "巴兰基亚",
+    "Cartagena": "卡塔赫纳", "Caracas": "加拉加斯", "Maracaibo": "马拉开波",
+    "Quito": "基多", "Guayaquil": "瓜亚基尔", "Montevideo": "蒙得维的亚",
+    "Asuncion": "亚松森", "La Paz": "拉巴斯", "Santa Cruz": "圣克鲁斯",
+    "Georgetown": "乔治敦", "Paramaribo": "帕拉马里博", "Cayenne": "卡宴",
+    # 大洋洲主要城市
+    "Sydney": "悉尼", "Melbourne": "墨尔本", "Brisbane": "布里斯班",
+    "Perth": "珀斯", "Adelaide": "阿德莱德", "Canberra": "堪培拉",
+    "Gold Coast": "黄金海岸", "Hobart": "霍巴特", "Darwin": "达尔文",
+    "Wollongong": "伍伦贡", "Geelong": "吉朗", "Auckland": "奥克兰",
+    "Wellington": "惠灵顿", "Christchurch": "克赖斯特彻奇", "Tauranga": "陶朗加",
+    "Dunedin": "达尼丁", "Suva": "苏瓦", "Port Moresby": "莫尔兹比港",
+    "Noumea": "努美阿", "Papeete": "帕皮提",
+    # 非洲主要城市
+    "Johannesburg": "约翰内斯堡", "Cape Town": "开普敦", "Durban": "德班",
+    "Pretoria": "比勒陀利亚", "East London": "东伦敦", "Bloemfontein": "布隆方丹",
+    "Nairobi": "内罗毕", "Mombasa": "蒙巴萨", "Kisumu": "基苏木",
+    "Lagos": "拉各斯", "Abuja": "阿布贾", "Ibadan": "伊巴丹", "Kano": "卡诺",
+    "Accra": "阿克拉", "Kumasi": "库马西", "Cairo": "开罗", "Alexandria": "亚历山大",
+    "Giza": "吉萨", "Casablanca": "卡萨布兰卡", "Rabat": "拉巴特",
+    "Marrakesh": "马拉喀什", "Fes": "非斯", "Tangier": "丹吉尔",
+    "Tunis": "突尼斯市", "Algiers": "阿尔及尔", "Oran": "奥兰",
+    "Tripoli": "的黎波里", "Khartoum": "喀土穆", "Addis Ababa": "亚的斯亚贝巴",
+    "Dar es Salaam": "达累斯萨拉姆", "Dodoma": "多多马", "Kampala": "坎帕拉",
+    "Lusaka": "卢萨卡", "Harare": "哈拉雷", "Maputo": "马普托", "Luanda": "罗安达",
+    "Kinshasa": "金沙萨", "Douala": "杜阿拉", "Yaounde": "雅温得",
+    "Abidjan": "阿比让", "Dakar": "达喀尔", "Bamako": "巴马科",
+    "Ouagadougou": "瓦加杜古", "Antananarivo": "塔那那利佛", "Mauritius": "毛里求斯",
+}
+
+
 def _translate_geo_label(raw):
     """Translate stored GeoIP labels into Chinese for display.
 
@@ -816,6 +995,8 @@ def _translate_geo_label(raw):
             return CONTINENT_NAMES[token]
         if token in CN_REGION_NAMES:
             return CN_REGION_NAMES[token]
+        if token in CITY_NAMES:
+            return CITY_NAMES[token]
         return token
 
     if "·" in raw:
@@ -888,6 +1069,7 @@ def render_success_page(client_ip, message=""):
         .replace("__GEOIP_NOTICE__", geo_notice)
         .replace("__MANAGE_ACTION__", MANAGE_ACTION)
         .replace("__LOGOUT_ACTION__", LOGOUT_ACTION)
+        .replace("__VERSION__", SCRIPT_VERSION)
     )
 
 
@@ -899,7 +1081,12 @@ def render_login_page(logout=False):
     notice = ""
     if logout:
         notice = '<div class="notice">您已退出登录，IP 仍保留在白名单中，可重新登录其它账号。</div>'
-    return LOGIN_PAGE.replace("__LOGIN_NOTICE__", notice).replace("__AUTH_ACTION__", LOGIN_ACTION)
+    return (
+        LOGIN_PAGE
+        .replace("__LOGIN_NOTICE__", notice)
+        .replace("__AUTH_ACTION__", LOGIN_ACTION)
+        .replace("__VERSION__", SCRIPT_VERSION)
+    )
 
 
 LOGIN_PAGE = """<!doctype html>
@@ -926,6 +1113,7 @@ button:hover { background: #1d4ed8; }
 .notice { margin-bottom: 16px; padding: 10px 12px; border-radius: 6px; font-size: 13px;
           background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
 .muted { margin-top: 18px; text-align: center; color: #94a3b8; }
+.ver { margin-top: 14px; text-align: center; color: #94a3b8; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -941,6 +1129,7 @@ button:hover { background: #1d4ed8; }
     <button type="submit">登录 / Sign In</button>
   </form>
   <p class="muted">Server Access Authorization</p>
+  <p class="ver">Web Authentication Firewall v__VERSION__</p>
 </div>
 </body>
 </html>"""
@@ -1016,6 +1205,7 @@ button.add { background: #0f766e; color: #ffffff; }
 .note { margin-top: 10px; font-size: 11px; color: #64748b; }
 .muted { margin-top: 18px; text-align: center; color: #64748b; font-size: 12px; }
 .footer { display: flex; justify-content: center; margin-top: 18px; }
+.ver { margin-top: 12px; text-align: center; color: #94a3b8; font-size: 11px; }
 @media (max-width: 640px) {
   body { padding: 12px; }
   .card { padding: 18px 12px; border-radius: 8px; }
@@ -1108,6 +1298,7 @@ button.add { background: #0f766e; color: #ffffff; }
   </div>
   <p class="muted">白名单有效期 __WHITELIST_TTL__ 小时，到期后需重新登录。Your IP address has been whitelisted.</p>
   <div class="footer"><a class="logoutbtn" href="__LOGOUT_ACTION__">退出登录 / Log Out</a></div>
+  <p class="ver">Web Authentication Firewall v__VERSION__</p>
 </div>
 </body>
 </html>"""
@@ -1168,7 +1359,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.1.3"
+    server_version = "WebAuthFirewall/1.1.4"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -2354,6 +2545,9 @@ update_geoip() {
   python3 "${INSTALL_DIR}/geoip_update.py" || die "GeoIP 数据库更新失败。"
   chmod 644 "${ETC_DIR}/geoip.dat"
   say "GeoIP 数据库更新完成。"
+  systemctl restart "${SERVICE}" >/dev/null 2>&1 \
+    || warn "GeoIP 更新完成，但认证服务重启失败，请手动执行：systemctl restart ${SERVICE}"
+  say "认证服务已重启，新的 GeoIP 数据已生效。"
 }
 
 manage_whitelist() {
@@ -2421,7 +2615,7 @@ show_menu() {
   server_ip="$(get_server_ip)"
   clear 2>/dev/null || true
   echo "====================================================="
-  echo "        Web Authentication Firewall 管理面板"
+  echo "        Web Authentication Firewall v${VERSION} 管理面板"
   echo "====================================================="
   echo "  登录地址: $(format_login_url "${server_ip}")"
   echo "====================================================="
