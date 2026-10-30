@@ -15,6 +15,17 @@
 #
 #
 # Version history:
+#   1.2.3 (2026-10):
+#     - fix: authorize browser management forms with a SameSite session cookie
+#   1.2.2 (2026-10):
+#     - fix: make web management origin checks compatible with browser proxies
+#   1.2.1 (2026-10):
+#     - fix: keep GeoIP temp files under STATE_DIR when systemd uses PrivateTmp
+#   1.2.0 (2026-10):
+#     - feat: run GeoIP updates from the web management page with background status
+#     - fix: replace the GeoIP database atomically and reload it without a service restart
+#   1.1.6 (2026-10):
+#     - fix: place GeoIP temporary files on disk-backed /var/tmp and check free space
 #   1.1.5 (2026-09):
 #     - fix: correctly parse db-ip city-lite CSV columns so city names are kept
 #   1.1.4 (2026-09):
@@ -27,7 +38,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.1.5"
+VERSION="1.2.3"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
@@ -43,6 +54,7 @@ CRED_FILE="${ETC_DIR}/credentials"
 NFT_CONF="/etc/nftables.conf"
 NFT_BACKUP="${NFT_CONF}.pre-web-auth"
 AUTH_PORT_CONFIG="${ETC_DIR}/auth_port"
+GEOIP_TMP_DIR="${GEOIP_TMP_DIR:-${STATE_DIR}/geoip-tmp}"
 
 KEEP_SSH="auto"
 ALLOW_ICMP=0
@@ -337,13 +349,16 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
+import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 try:
     import geoip
@@ -366,6 +381,24 @@ NFT_BASE_CONF = os.environ.get("NFT_BASE_CONF", "/etc/nftables.conf")
 BIND_ADDR = os.environ.get("BIND_ADDR", "::")
 AUTH_PATH_CONFIG = os.environ.get("AUTH_PATH_CONFIG", "/etc/web-auth-firewall/auth_path")
 AUTH_PATH = os.environ.get("AUTH_PATH", "/").strip() or "/"
+GEOIP_FILE = os.environ.get("GEOIP_FILE", "/etc/web-auth-firewall/geoip.dat")
+GEOIP_TMP_DIR = os.environ.get(
+    "GEOIP_TMP_DIR",
+    os.path.join(os.path.dirname(STATE_FILE), "geoip-tmp"),
+)
+GEOIP_UPDATE_SCRIPT = os.environ.get(
+    "GEOIP_UPDATE_SCRIPT", "/opt/web-auth-firewall/geoip_update.py"
+)
+GEOIP_UPDATE_STATUS_FILE = os.environ.get(
+    "GEOIP_UPDATE_STATUS_FILE",
+    os.path.join(os.path.dirname(STATE_FILE), "geoip_update_status.json"),
+)
+GEOIP_UPDATE_LOG_FILE = os.environ.get(
+    "GEOIP_UPDATE_LOG_FILE",
+    os.path.join(os.path.dirname(STATE_FILE), "geoip_update.log"),
+)
+GEOIP_UPDATE_TIMEOUT_SECONDS = int(os.environ.get("GEOIP_UPDATE_TIMEOUT_SECONDS", "1800"))
+GEOIP_MIN_FREE_BYTES = 1024 * 1024 * 1024
 try:
     with open(AUTH_PATH_CONFIG, "r", encoding="ascii") as fh:
         configured_path = fh.read().strip()
@@ -380,7 +413,8 @@ if AUTH_PATH != "/":
 LOGIN_ACTION = AUTH_PATH if AUTH_PATH != "/" else "/"
 MANAGE_ACTION = AUTH_PATH + "/manage" if AUTH_PATH != "/" else "/manage"
 LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
-SCRIPT_VERSION = "1.1.5"
+SCRIPT_VERSION = "1.2.3"
+MANAGE_CSRF_TOKEN = secrets.token_urlsafe(32)
 
 # Immutable defaults. The service refuses to start if the on-disk
 # credentials file does not match these exact values.
@@ -451,6 +485,15 @@ RECONCILE_INTERVAL_SECONDS = int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "3
 MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", "16"))
 _REQUEST_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
 _PORT_CACHE = {"ts": 0.0, "tcp": [], "udp": []}
+GEOIP_UPDATE_LOCK = threading.RLock()
+GEOIP_UPDATE_THREAD = None
+GEOIP_UPDATE_STATUS = {
+    "running": False,
+    "result": "idle",
+    "message": "",
+    "started_at": None,
+    "finished_at": None,
+}
 
 WHITELIST_SETS = {"4": "whitelist_v4", "6": "whitelist_v6"}
 BLACKLIST_SETS = {"4": "blacklist_v4", "6": "blacklist_v6"}
@@ -467,6 +510,165 @@ def empty_state():
 
 
 STATE = empty_state()
+
+
+def empty_geoip_update_status():
+    return {
+        "running": False,
+        "result": "idle",
+        "message": "",
+        "started_at": None,
+        "finished_at": None,
+    }
+
+
+def save_geoip_update_status_unlocked():
+    os.makedirs(os.path.dirname(GEOIP_UPDATE_STATUS_FILE) or ".", exist_ok=True)
+    tmp = GEOIP_UPDATE_STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(GEOIP_UPDATE_STATUS, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, GEOIP_UPDATE_STATUS_FILE)
+    try:
+        os.chmod(GEOIP_UPDATE_STATUS_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def restore_geoip_update_status():
+    global GEOIP_UPDATE_STATUS
+    with GEOIP_UPDATE_LOCK:
+        try:
+            with open(GEOIP_UPDATE_STATUS_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            GEOIP_UPDATE_STATUS = empty_geoip_update_status()
+            return
+        if not isinstance(data, dict):
+            GEOIP_UPDATE_STATUS = empty_geoip_update_status()
+            return
+        status = empty_geoip_update_status()
+        status.update(
+            {
+                "running": bool(data.get("running", False)),
+                "result": str(data.get("result", "idle")),
+                "message": str(data.get("message", "")),
+                "started_at": data.get("started_at"),
+                "finished_at": data.get("finished_at"),
+            }
+        )
+        if status["running"]:
+            status.update(
+                {
+                    "running": False,
+                    "result": "failed",
+                    "message": "上一次 GeoIP 更新因认证服务重启而中断。",
+                    "finished_at": time.time(),
+                }
+            )
+            GEOIP_UPDATE_STATUS = status
+            save_geoip_update_status_unlocked()
+            return
+        GEOIP_UPDATE_STATUS = status
+
+
+def get_geoip_update_status():
+    with GEOIP_UPDATE_LOCK:
+        return dict(GEOIP_UPDATE_STATUS)
+
+
+def start_geoip_update():
+    global GEOIP_UPDATE_THREAD
+    with GEOIP_UPDATE_LOCK:
+        if GEOIP_UPDATE_STATUS["running"]:
+            return False, "GeoIP 数据库正在更新，请等待当前任务完成。"
+        GEOIP_UPDATE_STATUS.update(
+            {
+                "running": True,
+                "result": "running",
+                "message": "正在下载并构建最新 GeoIP 数据库。",
+                "started_at": time.time(),
+                "finished_at": None,
+            }
+        )
+        save_geoip_update_status_unlocked()
+        GEOIP_UPDATE_THREAD = threading.Thread(
+            target=run_geoip_update_worker,
+            name="geoip-update",
+            daemon=True,
+        )
+        GEOIP_UPDATE_THREAD.start()
+    return True, "GeoIP 数据库更新任务已在后台启动。"
+
+
+def run_geoip_update_worker():
+    global GEOIP_UPDATE_STATUS, GEOIP_UPDATE_THREAD
+    result = "failed"
+    message = "GeoIP 数据库更新失败。"
+    try:
+        os.makedirs(os.path.dirname(GEOIP_UPDATE_LOG_FILE) or ".", exist_ok=True)
+        with open(GEOIP_UPDATE_LOG_FILE, "wb", buffering=0) as log_file:
+            log_file.write(
+                ("GeoIP update started at %s\n" % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+                .encode("utf-8")
+            )
+            os.makedirs(GEOIP_TMP_DIR, mode=0o700, exist_ok=True)
+            free_bytes = shutil.disk_usage(GEOIP_TMP_DIR).free
+            if free_bytes < GEOIP_MIN_FREE_BYTES:
+                raise OSError(
+                    "GeoIP 临时目录空间不足：至少需要 1 GiB，当前可用 %d MiB。"
+                    % (free_bytes // (1024 * 1024))
+                )
+            if not os.path.isfile(GEOIP_UPDATE_SCRIPT):
+                raise FileNotFoundError("找不到 GeoIP 更新程序：%s" % GEOIP_UPDATE_SCRIPT)
+            env = os.environ.copy()
+            env["TMPDIR"] = GEOIP_TMP_DIR
+            env["GEOIP_TMP_DIR"] = GEOIP_TMP_DIR
+            env["GEOIP_OUTPUT"] = GEOIP_FILE
+            env["PYTHONUNBUFFERED"] = "1"
+            completed = subprocess.run(
+                [sys.executable, GEOIP_UPDATE_SCRIPT],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                timeout=GEOIP_UPDATE_TIMEOUT_SECONDS,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError("GeoIP 更新程序退出码：%d" % completed.returncode)
+            result = "success"
+            message = "GeoIP 数据库已更新，并在当前服务中重新加载。"
+            try:
+                os.chmod(GEOIP_FILE, 0o644)
+                if geoip is not None:
+                    geoip.reload()
+            except OSError as exc:
+                message = "GeoIP 数据库已更新，但重新加载失败：%s。请重启认证服务。" % exc
+                LOG.error("%s", message)
+            log_file.write(
+                ("GeoIP update completed at %s\n" % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()))
+                .encode("utf-8")
+            )
+    except subprocess.TimeoutExpired:
+        message = "GeoIP 数据库更新超时（%d 分钟）。" % (GEOIP_UPDATE_TIMEOUT_SECONDS // 60)
+        LOG.error("%s", message)
+    except Exception as exc:
+        message = "GeoIP 数据库更新失败：%s" % exc
+        LOG.error("%s", message)
+    finally:
+        with GEOIP_UPDATE_LOCK:
+            GEOIP_UPDATE_STATUS.update(
+                {
+                    "running": False,
+                    "result": result,
+                    "message": message,
+                    "finished_at": time.time(),
+                }
+            )
+            GEOIP_UPDATE_THREAD = None
+            try:
+                save_geoip_update_status_unlocked()
+            except OSError as exc:
+                LOG.error("cannot save GeoIP update status: %s", exc)
 
 
 def password_hash(password):
@@ -764,6 +966,77 @@ def port_badges(ports):
     return "".join('<span class="port">%d</span>' % port for port in ports)
 
 
+def format_status_time(timestamp):
+    try:
+        value = float(timestamp)
+    except (TypeError, ValueError):
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(value))
+
+
+def render_geoip_update_panel():
+    status = get_geoip_update_status()
+    running = status["running"]
+    result = status["result"]
+    available = geoip is not None and geoip.is_available()
+    if running:
+        status_class = "running"
+        status_label = "更新中"
+    elif result == "success":
+        status_class = "success"
+        status_label = "更新成功"
+    elif result == "failed":
+        status_class = "error"
+        status_label = "更新失败"
+    elif available:
+        status_class = "success"
+        status_label = "可用"
+    else:
+        status_class = "unknown"
+        status_label = "尚未安装"
+
+    details = []
+    if status["message"]:
+        details.append('<div class="note">%s</div>' % escape(status["message"]))
+    if status["started_at"]:
+        details.append(
+            '<div class="note">开始时间：%s</div>' % escape(format_status_time(status["started_at"]))
+        )
+    if status["finished_at"] and not running:
+        details.append(
+            '<div class="note">完成时间：%s</div>' % escape(format_status_time(status["finished_at"]))
+        )
+    if not details:
+        details.append('<div class="note">点击按钮下载并构建最新离线 GeoIP 数据。</div>')
+
+    disabled = " disabled" if running else ""
+    action_label = "正在更新..." if running else "更新 GeoIP 数据库"
+    return (
+        '<div class="geoip-update">'
+        '<div class="geoip-copy">'
+        '<div class="geoip-title">GeoIP 数据库'
+        '<span class="geoip-status %s">%s</span>'
+        "</div>"
+        "%s"
+        "</div>"
+        '<form method="post" action="%s" '
+        'onsubmit="return confirm(\'确定现在下载并更新 GeoIP 数据库吗？更新将在后台运行。\');">'
+        '<input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">'
+        '<input type="hidden" name="action" value="update_geoip">'
+        '<button type="submit" class="small update"%s>%s</button>'
+        "</form>"
+        "</div>"
+        % (
+            status_class,
+            status_label,
+            "".join(details),
+            MANAGE_ACTION,
+            disabled,
+            action_label,
+        )
+    )
+
+
 COUNTRY_NAMES = {
     "CN": "中国", "US": "美国", "JP": "日本", "KR": "韩国", "SG": "新加坡",
     "HK": "中国香港", "TW": "中国台湾", "MO": "中国澳门", "GB": "英国", "DE": "德国",
@@ -1038,6 +1311,7 @@ def render_list_rows(kind):
                 '<span class="expiry">%s</span>'
                 '%s'
                 '<form method="post" action="%s">'
+                '<input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">'
                 '<input type="hidden" name="action" value="%s">'
                 '<input type="hidden" name="ip" value="%s">'
                 '<button type="submit" class="small danger">删除</button>'
@@ -1054,11 +1328,15 @@ def render_success_page(client_ip, message=""):
     msg_html = ""
     if message:
         msg_html = '<div class="msg">%s</div>' % escape(message)
-    geo_notice = ""
-    if geoip is None or not geoip.is_available():
-        geo_notice = '<div class="msg">未安装 GeoIP 数据库，请在后台菜单选择“更新 GeoIP 数据库”。</div>'
+    update_status = get_geoip_update_status()
+    geoip_refresh = (
+        '<meta http-equiv="refresh" content="5">'
+        if update_status["running"]
+        else ""
+    )
     return (
         SUCCESS_PAGE
+        .replace("__GEOIP_REFRESH__", geoip_refresh)
         .replace("__CLIENT_IP__", escape(client_ip))
         .replace("__CLIENT_GEO__", geo_label(client_ip))
         .replace("__TCP_PORTS__", port_badges(tcp_ports))
@@ -1068,7 +1346,8 @@ def render_success_page(client_ip, message=""):
         .replace("__WHITELIST_TTL__", str(WHITELIST_TTL_HOURS))
         .replace("__BLACKLIST_TTL__", str(BLACKLIST_TTL_HOURS))
         .replace("__MANAGE_MESSAGE__", msg_html)
-        .replace("__GEOIP_NOTICE__", geo_notice)
+        .replace("__GEOIP_UPDATE_PANEL__", render_geoip_update_panel())
+        .replace("__MANAGE_CSRF_TOKEN__", MANAGE_CSRF_TOKEN)
         .replace("__MANAGE_ACTION__", MANAGE_ACTION)
         .replace("__LOGOUT_ACTION__", LOGOUT_ACTION)
         .replace("__VERSION__", SCRIPT_VERSION)
@@ -1141,6 +1420,7 @@ SUCCESS_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+__GEOIP_REFRESH__
 <title>Access Granted</title>
 <style>
 * { box-sizing: border-box; }
@@ -1202,6 +1482,19 @@ button.add { background: #0f766e; color: #ffffff; }
 .addform input { flex: 1; min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #cbd5e1; border-radius: 6px;
                  background: #ffffff; color: #0f172a; font-size: 13px; }
 .addform button { flex-shrink: 0; height: 38px; }
+.geoip-update { display: flex; justify-content: space-between; align-items: center; gap: 16px;
+                margin-top: 14px; padding: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; }
+.geoip-copy { min-width: 0; }
+.geoip-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: #334155; }
+.geoip-status { display: inline-block; border-radius: 4px; padding: 2px 6px; font-size: 10px; font-weight: 700; }
+.geoip-status.running { background: #dbeafe; color: #1d4ed8; }
+.geoip-status.success { background: #dcfce7; color: #166534; }
+.geoip-status.error { background: #fee2e2; color: #b91c1c; }
+.geoip-status.unknown { background: #f1f5f9; color: #64748b; }
+.geoip-update .note { margin: 5px 0 0; }
+button.update { background: #1d4ed8; color: #ffffff; }
+button.update:hover { background: #1e40af; }
+button:disabled, button:disabled:hover { background: #cbd5e1; color: #64748b; cursor: not-allowed; }
 .msg { margin-top: 14px; padding: 10px 12px; border-radius: 6px; font-size: 13px;
        background: #f0fdf4; color: #166534; border: 1px solid #a7f3d0; }
 .note { margin-top: 10px; font-size: 11px; color: #64748b; }
@@ -1213,6 +1506,8 @@ button.add { background: #0f766e; color: #ffffff; }
   .card { padding: 18px 12px; border-radius: 8px; }
   .ipbox .value { font-size: 20px; }
   .ports, .manage-grid, .addforms { grid-template-columns: 1fr; }
+  .geoip-update { align-items: stretch; flex-direction: column; }
+  .geoip-update form, .geoip-update button { width: 100%; }
   .iprow { gap: 5px; }
   .ipaddr { font-size: 12px; }
   .family { display: none; }
@@ -1248,6 +1543,7 @@ button.add { background: #0f766e; color: #ffffff; }
           <h3>白名单 IP（__WHITELIST_TTL__ 小时有效）</h3>
           <div class="listactions">
             <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+              <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
               <input type="hidden" name="action" value="update_ttl">
               <input type="hidden" name="blacklist_hours" value="__BLACKLIST_TTL__">
               <input name="whitelist_hours" type="number" min="1" max="720" value="__WHITELIST_TTL__" title="白名单有效小时数" required>
@@ -1255,6 +1551,7 @@ button.add { background: #0f766e; color: #ffffff; }
             </form>
             <a class="btn" href="__MANAGE_ACTION__">刷新</a>
             <form method="post" action="__MANAGE_ACTION__" onsubmit="return confirm('确定清空全部白名单吗？清空后您需要重新登录。');">
+              <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
               <input type="hidden" name="action" value="clear_whitelist">
               <button type="submit" class="small danger">清空</button>
             </form>
@@ -1267,6 +1564,7 @@ button.add { background: #0f766e; color: #ffffff; }
           <h3>黑名单 IP（__BLACKLIST_TTL__ 小时有效）</h3>
           <div class="listactions">
             <form method="post" action="__MANAGE_ACTION__" class="ttlinline">
+              <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
               <input type="hidden" name="action" value="update_ttl">
               <input type="hidden" name="whitelist_hours" value="__WHITELIST_TTL__">
               <input name="blacklist_hours" type="number" min="1" max="720" value="__BLACKLIST_TTL__" title="黑名单有效小时数" required>
@@ -1274,6 +1572,7 @@ button.add { background: #0f766e; color: #ffffff; }
             </form>
             <a class="btn" href="__MANAGE_ACTION__">刷新</a>
             <form method="post" action="__MANAGE_ACTION__" onsubmit="return confirm('确定清空全部黑名单吗？');">
+              <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
               <input type="hidden" name="action" value="clear_blacklist">
               <button type="submit" class="small danger">清空</button>
             </form>
@@ -1284,18 +1583,20 @@ button.add { background: #0f766e; color: #ffffff; }
     </div>
     <div class="addforms">
       <form method="post" action="__MANAGE_ACTION__" class="addform">
+        <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
         <input type="hidden" name="action" value="add_whitelist">
         <input name="ip" placeholder="添加白名单 IP" required>
         <button type="submit" class="small add">加入白名单</button>
       </form>
       <form method="post" action="__MANAGE_ACTION__" class="addform">
+        <input type="hidden" name="csrf" value="__MANAGE_CSRF_TOKEN__">
         <input type="hidden" name="action" value="add_blacklist">
         <input name="ip" placeholder="添加黑名单 IP" required>
         <button type="submit" class="small danger">加入黑名单</button>
       </form>
     </div>
     __MANAGE_MESSAGE__
-    __GEOIP_NOTICE__
+    __GEOIP_UPDATE_PANEL__
     <p class="note">删除自己的 IP 后将立即失去服务器访问权限。</p>
   </div>
   <p class="muted">白名单有效期 __WHITELIST_TTL__ 小时，到期后需重新登录。Your IP address has been whitelisted.</p>
@@ -1361,7 +1662,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.1.5"
+    server_version = "WebAuthFirewall/1.2.3"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -1387,6 +1688,54 @@ class AuthHandler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.end_headers()
         self.wfile.write(body)
+
+    def _request_is_same_origin(self):
+        host = self.headers.get("Host", "").strip().lower()
+        origin = self.headers.get("Origin", "").strip()
+        referer = self.headers.get("Referer", "").strip()
+        fetch_site = self.headers.get("Sec-Fetch-Site", "").strip().lower()
+        if origin.lower() == "null":
+            return True
+
+        def parse_origin(value):
+            try:
+                parsed = urlsplit(value)
+                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                    return None
+                port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            except ValueError:
+                return None
+            return parsed.hostname.lower(), port
+
+        try:
+            parsed_host = urlsplit("//" + host)
+            hostname = parsed_host.hostname
+            host_origin = (
+                (hostname.lower(), parsed_host.port or AUTH_PORT)
+                if hostname
+                else None
+            )
+        except ValueError:
+            host_origin = None
+
+        if host_origin is not None:
+            if origin and parse_origin(origin) == host_origin:
+                return True
+            if referer and parse_origin(referer) == host_origin:
+                return True
+            if fetch_site in ("same-origin", "none"):
+                return True
+            if not origin and not referer:
+                return True
+
+        LOG.warning(
+            "rejected management request: Host=%r Origin=%r Referer=%r Sec-Fetch-Site=%r",
+            host,
+            origin,
+            referer,
+            fetch_site,
+        )
+        return False
 
     def do_GET(self):
         path, _, query = self.path.partition("?")
@@ -1459,10 +1808,24 @@ class AuthHandler(BaseHTTPRequestHandler):
         if ip is None:
             self._send_html(400, "<html><body>Bad Request</body></html>")
             return
+        if not self._request_is_same_origin():
+            self._send_html(403, "<html><body>Cross-origin request denied</body></html>")
+            return
         if ip not in STATE["whitelist"][family]:
             self._send_html(403, FORBIDDEN_PAGE)
             return
+        csrf_token = params.get("csrf", [""])[0]
+        if not hmac.compare_digest(csrf_token, MANAGE_CSRF_TOKEN):
+            self._send_html(
+                403,
+                "<html><body>Management session expired. Refresh the page and try again.</body></html>",
+            )
+            return
         action = params.get("action", [""])[0]
+        if action == "update_geoip":
+            _, message = start_geoip_update()
+            self._send_html(200, render_success_page(ip, message=message))
+            return
         if action == "update_ttl":
             try:
                 wh = int(params.get("whitelist_hours", [""])[0])
@@ -1571,6 +1934,7 @@ def reconciler_loop():
 
 def main():
     global STATE
+    restore_geoip_update_status()
     if not verify_credentials_file():
         LOG.error("refusing to start: credentials are not the immutable defaults")
         return 1
@@ -1710,6 +2074,8 @@ PYEOF
 }
 
 write_geoip_scripts() {
+  install -d -m 700 "${GEOIP_TMP_DIR}" \
+    || die "无法创建 GeoIP 临时目录：${GEOIP_TMP_DIR}"
   for f in geoip.py geoip_build.py geoip_update.py; do
     if [[ -f "${INSTALL_DIR}/${f}" ]] && command -v chattr >/dev/null 2>&1; then
       chattr -i "${INSTALL_DIR}/${f}" 2>/dev/null || true
@@ -1723,12 +2089,14 @@ import ipaddress
 import mmap
 import os
 import struct
+import threading
 
 GEOIP_FILE = os.environ.get("GEOIP_FILE", "/etc/web-auth-firewall/geoip.dat")
 _HEADER = struct.Struct(">4sI")
 _RECORD = struct.Struct(">III")
 _mmap = None
 _count = 0
+_GEOIP_LOCK = threading.RLock()
 
 
 def _open():
@@ -1766,34 +2134,48 @@ def _record_at(index):
     return start, end, _name_at(name_off)
 
 
+def reload():
+    global _mmap, _count
+    with _GEOIP_LOCK:
+        if _mmap is not None:
+            try:
+                _mmap.close()
+            except (BufferError, OSError):
+                pass
+        _mmap = None
+        _count = 0
+
+
 def is_available():
-    _open()
-    return _mmap is not None and _count > 0
+    with _GEOIP_LOCK:
+        _open()
+        return _mmap is not None and _count > 0
 
 
 def country(ip_str):
-    _open()
-    if _mmap is None or _count == 0:
+    with _GEOIP_LOCK:
+        _open()
+        if _mmap is None or _count == 0:
+            return None
+        try:
+            value = int(ipaddress.ip_address(ip_str.strip()))
+        except ValueError:
+            return None
+        if value > 0xFFFFFFFF:
+            return None
+        low, high = 0, _count - 1
+        while low <= high:
+            mid = (low + high) // 2
+            start, end, label = _record_at(mid)
+            if value < start:
+                high = mid - 1
+            elif value > end:
+                low = mid + 1
+            else:
+                if label in ("", "-"):
+                    return None
+                return label
         return None
-    try:
-        value = int(ipaddress.ip_address(ip_str.strip()))
-    except ValueError:
-        return None
-    if value > 0xFFFFFFFF:
-        return None
-    low, high = 0, _count - 1
-    while low <= high:
-        mid = (low + high) // 2
-        start, end, label = _record_at(mid)
-        if value < start:
-            high = mid - 1
-        elif value > end:
-            low = mid + 1
-        else:
-            if label in ("", "-"):
-                return None
-            return label
-    return None
 PYEOF
   cat > "${INSTALL_DIR}/geoip_build.py" <<'PYEOF'
 #!/usr/bin/env python3
@@ -1811,6 +2193,11 @@ import tempfile
 _HEADER = struct.Struct(">4sI")
 _RECORD = struct.Struct(">III")
 _CHUNK_ROWS = 100000
+GEOIP_TMP_ROOT = (
+    os.environ.get("GEOIP_TMP_DIR")
+    or os.environ.get("TMPDIR")
+    or "/var/lib/web-auth-firewall/geoip-tmp"
+)
 
 
 def _line_key(line):
@@ -1859,7 +2246,8 @@ def main():
         print("usage: geoip_build.py <input.csv> <output.dat>", file=sys.stderr)
         return 2
     src, dst = sys.argv[1], sys.argv[2]
-    tmpdir = tempfile.mkdtemp(prefix="geoip_build_")
+    os.makedirs(GEOIP_TMP_ROOT, mode=0o700, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="geoip_build_", dir=GEOIP_TMP_ROOT)
     raw_path = os.path.join(tmpdir, "raw.tsv")
     sorted_path = os.path.join(tmpdir, "sorted.tsv")
     try:
@@ -1922,23 +2310,33 @@ def main():
         name_table = bytearray()
         name_offsets = {}
         table_start = _HEADER.size + count * _RECORD.size
-        with open(dst, "wb") as out:
-            out.write(_HEADER.pack(b"WGFG", count))
-            with open(sorted_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    parts = line.rstrip("\n").split("\t", 2)
-                    if len(parts) != 3:
-                        continue
-                    start, end = int(parts[0]), int(parts[1])
-                    label = parts[2]
-                    off = name_offsets.get(label)
-                    if off is None:
-                        off = table_start + len(name_table)
-                        name_offsets[label] = off
-                        name_table.extend(label.encode("utf-8"))
-                        name_table.append(0)
-                    out.write(_RECORD.pack(start, end, off))
-            out.write(bytes(name_table))
+        tmp_dst = "%s.tmp.%d" % (dst, os.getpid())
+        try:
+            with open(tmp_dst, "wb") as out:
+                out.write(_HEADER.pack(b"WGFG", count))
+                with open(sorted_path, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        parts = line.rstrip("\n").split("\t", 2)
+                        if len(parts) != 3:
+                            continue
+                        start, end = int(parts[0]), int(parts[1])
+                        label = parts[2]
+                        off = name_offsets.get(label)
+                        if off is None:
+                            off = table_start + len(name_table)
+                            name_offsets[label] = off
+                            name_table.extend(label.encode("utf-8"))
+                            name_table.append(0)
+                        out.write(_RECORD.pack(start, end, off))
+                out.write(bytes(name_table))
+            os.chmod(tmp_dst, 0o644)
+            os.replace(tmp_dst, dst)
+        except Exception:
+            try:
+                os.unlink(tmp_dst)
+            except OSError:
+                pass
+            raise
         print("built %d ranges -> %s" % (count, dst))
         return 0
     finally:
@@ -1964,6 +2362,11 @@ import urllib.request
 
 import geoip_build
 
+GEOIP_TMP_ROOT = (
+    os.environ.get("GEOIP_TMP_DIR")
+    or os.environ.get("TMPDIR")
+    or "/var/lib/web-auth-firewall/geoip-tmp"
+)
 _override = os.environ.get("GEOIP_URL", "")
 CANDIDATE_URLS = [_override] if _override else [
     "https://download.db-ip.com/free/dbip-city-lite-%s.csv.gz" % datetime.date.today().strftime("%Y-%m"),
@@ -2028,7 +2431,8 @@ def _fetch(url, dest):
 
 
 def main():
-    tmpdir = tempfile.mkdtemp(prefix="geoip_update_")
+    os.makedirs(GEOIP_TMP_ROOT, mode=0o700, exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="geoip_update_", dir=GEOIP_TMP_ROOT)
     try:
         dat_path = os.path.join(tmpdir, "geoip.dat")
         last_error = None
@@ -2182,6 +2586,9 @@ ExecStart=${PY_BIN} ${INSTALL_DIR}/auth_server.py
 Environment=AUTH_PORT=${AUTH_PORT}
 Environment=NFT_TABLE=${NFT_TABLE}
 Environment=AUTH_PATH=${AUTH_PATH}
+Environment=GEOIP_TMP_DIR=${GEOIP_TMP_DIR}
+Environment=GEOIP_FILE=${ETC_DIR}/geoip.dat
+Environment=GEOIP_UPDATE_SCRIPT=${INSTALL_DIR}/geoip_update.py
 Environment=RECONCILE_INTERVAL_SECONDS=300
 Environment=MAX_CONCURRENT_REQUESTS=16
 Restart=on-failure
@@ -2190,7 +2597,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 NoNewPrivileges=true
-ReadWritePaths=${STATE_DIR}
+ReadWritePaths=${STATE_DIR} ${ETC_DIR} ${GEOIP_TMP_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -2557,11 +2964,24 @@ custom_auth_port() {
 }
 
 update_geoip() {
+  local available_kb
   require_installed || return 1
+  if ! install -d -m 700 "${GEOIP_TMP_DIR}"; then
+    die "无法创建 GeoIP 临时目录：${GEOIP_TMP_DIR}"
+  fi
+  available_kb="$(
+    df -Pk "${GEOIP_TMP_DIR}" | awk 'NR == 2 { print $4 }'
+  )"
+  if [[ "${available_kb}" =~ ^[0-9]+$ ]] && (( available_kb < 1048576 )); then
+    die "GeoIP 临时目录所在分区空间不足：至少需要 1 GiB 可用空间（当前 $((available_kb / 1024)) MiB）。"
+  fi
+  say "GeoIP 临时目录: ${GEOIP_TMP_DIR}（剩余 $(df -Ph "${GEOIP_TMP_DIR}" | awk 'NR == 2 { print $4 }')）"
   warn "正在部署最新 GeoIP 工具..."
   write_geoip_scripts
   say "Updating GeoIP database (about 84MB, may take a few minutes)..."
-  python3 "${INSTALL_DIR}/geoip_update.py" || die "GeoIP 数据库更新失败。"
+  TMPDIR="${GEOIP_TMP_DIR}" GEOIP_TMP_DIR="${GEOIP_TMP_DIR}" \
+    python3 "${INSTALL_DIR}/geoip_update.py" \
+    || die "GeoIP 数据库更新失败。"
   chmod 644 "${ETC_DIR}/geoip.dat"
   say "GeoIP 数据库更新完成。"
   systemctl restart "${SERVICE}" >/dev/null 2>&1 \
