@@ -15,8 +15,11 @@
 #
 #
 # Version history:
+#   1.2.4 (2026-10):
+#     - fix: preserve the configured login path and port across reinstalls
+#     - fix: restart the service after install and report its runtime endpoint
 #   1.2.3 (2026-10):
-#     - fix: authorize browser management forms with a SameSite session cookie
+#     - fix: authorize browser management forms with a per-process CSRF token
 #   1.2.2 (2026-10):
 #     - fix: make web management origin checks compatible with browser proxies
 #   1.2.1 (2026-10):
@@ -38,18 +41,25 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.3"
+VERSION="1.2.4"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
-AUTH_PORT="${AUTH_PORT:-18622}"
+AUTH_PORT_SET=0
+if [[ -n "${AUTH_PORT:-}" ]]; then
+  AUTH_PORT_SET=1
+else
+  AUTH_PORT="18622"
+fi
 AUTH_PATH="/"
+AUTH_PATH_SET=0
 NFT_TABLE="web_auth"
 SERVICE="web-auth-firewall"
 INSTALL_DIR="/opt/web-auth-firewall"
 ETC_DIR="/etc/web-auth-firewall"
 STATE_DIR="/var/lib/web-auth-firewall"
 STATE_FILE="${STATE_DIR}/state.json"
+RUNTIME_FILE="${STATE_DIR}/runtime.json"
 CRED_FILE="${ETC_DIR}/credentials"
 NFT_CONF="/etc/nftables.conf"
 NFT_BACKUP="${NFT_CONF}.pre-web-auth"
@@ -111,23 +121,28 @@ parse_args() {
       --port)
         [[ -n "${2:-}" ]] || die "--port requires a value"
         AUTH_PORT="$2"
+        AUTH_PORT_SET=1
         shift 2
         ;;
       --port=*)
         AUTH_PORT="${1#*=}"
+        AUTH_PORT_SET=1
         shift
         ;;
       --path)
         [[ -n "${2:-}" ]] || die "--path requires a value"
         normalize_auth_path "$2"
+        AUTH_PATH_SET=1
         shift 2
         ;;
       --path=*)
         normalize_auth_path "${1#*=}"
+        AUTH_PATH_SET=1
         shift
         ;;
       --random-path)
         AUTH_PATH="/$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)"
+        AUTH_PATH_SET=1
         shift
         ;;
       --update-geoip)
@@ -377,6 +392,10 @@ except (OSError, ValueError):
 NFT_TABLE = os.environ.get("NFT_TABLE", "web_auth")
 CRED_FILE = os.environ.get("CRED_FILE", "/etc/web-auth-firewall/credentials")
 STATE_FILE = os.environ.get("STATE_FILE", "/var/lib/web-auth-firewall/state.json")
+RUNTIME_FILE = os.environ.get(
+    "RUNTIME_FILE",
+    os.path.join(os.path.dirname(STATE_FILE), "runtime.json"),
+)
 NFT_BASE_CONF = os.environ.get("NFT_BASE_CONF", "/etc/nftables.conf")
 BIND_ADDR = os.environ.get("BIND_ADDR", "::")
 AUTH_PATH_CONFIG = os.environ.get("AUTH_PATH_CONFIG", "/etc/web-auth-firewall/auth_path")
@@ -413,7 +432,7 @@ if AUTH_PATH != "/":
 LOGIN_ACTION = AUTH_PATH if AUTH_PATH != "/" else "/"
 MANAGE_ACTION = AUTH_PATH + "/manage" if AUTH_PATH != "/" else "/manage"
 LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
-SCRIPT_VERSION = "1.2.3"
+SCRIPT_VERSION = "1.2.4"
 MANAGE_CSRF_TOKEN = secrets.token_urlsafe(32)
 
 # Immutable defaults. The service refuses to start if the on-disk
@@ -803,6 +822,24 @@ def save_state(state):
         os.chmod(STATE_FILE, 0o600)
     except OSError:
         pass
+
+
+def save_runtime_config():
+    data = {
+        "auth_path": AUTH_PATH,
+        "auth_port": AUTH_PORT,
+        "bind_addr": BIND_ADDR,
+        "pid": os.getpid(),
+        "script_version": SCRIPT_VERSION,
+        "started_at": time.time(),
+    }
+    os.makedirs(os.path.dirname(RUNTIME_FILE) or ".", exist_ok=True)
+    tmp = RUNTIME_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, RUNTIME_FILE)
 
 
 def count_state(kind):
@@ -1662,7 +1699,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.2.3"
+    server_version = "WebAuthFirewall/1.2.4"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -1939,6 +1976,7 @@ def main():
         LOG.error("refusing to start: credentials are not the immutable defaults")
         return 1
     STATE = load_state()
+    save_runtime_config()
     reconcile()
     server = build_server()
     server.daemon_threads = True
@@ -2589,6 +2627,7 @@ Environment=AUTH_PATH=${AUTH_PATH}
 Environment=GEOIP_TMP_DIR=${GEOIP_TMP_DIR}
 Environment=GEOIP_FILE=${ETC_DIR}/geoip.dat
 Environment=GEOIP_UPDATE_SCRIPT=${INSTALL_DIR}/geoip_update.py
+Environment=RUNTIME_FILE=${RUNTIME_FILE}
 Environment=RECONCILE_INTERVAL_SECONDS=300
 Environment=MAX_CONCURRENT_REQUESTS=16
 Restart=on-failure
@@ -2679,7 +2718,11 @@ apply_firewall() {
 
 start_service() {
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE}" >/dev/null
+  systemctl enable "${SERVICE}" >/dev/null
+  if ! systemctl restart "${SERVICE}"; then
+    journalctl -u "${SERVICE}" -n 40 --no-pager || true
+    die "Service ${SERVICE} failed to start; see log above."
+  fi
   if ! systemctl is-active --quiet "${SERVICE}"; then
     journalctl -u "${SERVICE}" -n 40 --no-pager || true
     die "Service ${SERVICE} failed to start; see log above."
@@ -2794,7 +2837,40 @@ normalize_auth_path() {
   AUTH_PATH="/${p}"
 }
 
+get_runtime_auth_value() {
+  local key="$1" main_pid value
+  systemctl is-active --quiet "${SERVICE}" 2>/dev/null || return 0
+  [[ -s "${RUNTIME_FILE}" ]] || return 0
+  main_pid="$(systemctl show "${SERVICE}" -p MainPID --value 2>/dev/null || true)"
+  [[ "${main_pid}" =~ ^[0-9]+$ ]] && (( main_pid > 0 )) || return 0
+  value="$(
+    python3 - "${RUNTIME_FILE}" "${key}" "${main_pid}" <<'PYEOF' 2>/dev/null
+import json
+import sys
+
+path, key, expected_pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if int(data.get("pid", 0)) != expected_pid:
+    raise SystemExit(0)
+value = data.get(key)
+if value is not None:
+    print(value)
+PYEOF
+  )" || value=""
+  printf '%s' "${value}"
+}
+
 get_auth_path() {
+  local runtime_path
+  runtime_path="$(get_runtime_auth_value auth_path)"
+  if [[ -n "${runtime_path}" ]]; then
+    printf '%s' "${runtime_path}"
+    return 0
+  fi
   if [[ -f "${ETC_DIR}/auth_path" ]]; then
     cat "${ETC_DIR}/auth_path"
   else
@@ -2819,6 +2895,12 @@ normalize_auth_port() {
 }
 
 get_auth_port() {
+  local runtime_port
+  runtime_port="$(get_runtime_auth_value auth_port)"
+  if [[ -n "${runtime_port}" ]]; then
+    printf '%s' "${runtime_port}"
+    return 0
+  fi
   if [[ -f "${ETC_DIR}/auth_port" ]]; then
     cat "${ETC_DIR}/auth_port"
   else
@@ -3101,8 +3183,28 @@ menu() {
   done
 }
 
+preserve_existing_endpoint_settings() {
+  local saved_path saved_port
+  if [[ "${AUTH_PATH_SET}" != "1" && -f "${ETC_DIR}/auth_path" ]]; then
+    saved_path="$(sed -n '1p' "${ETC_DIR}/auth_path")"
+    if [[ -n "${saved_path}" ]]; then
+      normalize_auth_path "${saved_path}"
+      say "Preserved login path: ${AUTH_PATH}"
+    fi
+  fi
+  if [[ "${AUTH_PORT_SET}" != "1" && -f "${ETC_DIR}/auth_port" ]]; then
+    saved_port="$(sed -n '1p' "${ETC_DIR}/auth_port")"
+    if [[ -n "${saved_port}" ]] && normalize_auth_port "${saved_port}"; then
+      say "Preserved authentication port: ${AUTH_PORT}"
+    else
+      warn "Existing authentication port is invalid; using ${AUTH_PORT}."
+    fi
+  fi
+}
+
 install_web_auth() {
   ensure_tools
+  preserve_existing_endpoint_settings
   backup_existing_ruleset
   save_pre_install_state
   stop_conflicting_firewalls
