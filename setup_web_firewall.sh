@@ -15,6 +15,8 @@
 #
 #
 # Version history:
+#   1.2.5 (2026-10):
+#     - fix: recover SSH source across sudo so one-click installs keep SSH access
 #   1.2.4 (2026-10):
 #     - fix: preserve the configured login path and port across reinstalls
 #     - fix: restart the service after install and report its runtime endpoint
@@ -41,7 +43,7 @@
 #
 set -Eeuo pipefail
 
-VERSION="1.2.4"
+VERSION="1.2.5"
 
 AUTH_USER="admin"
 AUTH_PASSWORD='P@ssw0rd'
@@ -432,7 +434,7 @@ if AUTH_PATH != "/":
 LOGIN_ACTION = AUTH_PATH if AUTH_PATH != "/" else "/"
 MANAGE_ACTION = AUTH_PATH + "/manage" if AUTH_PATH != "/" else "/manage"
 LOGOUT_ACTION = AUTH_PATH + "/logout" if AUTH_PATH != "/" else "/logout"
-SCRIPT_VERSION = "1.2.4"
+SCRIPT_VERSION = "1.2.5"
 MANAGE_CSRF_TOKEN = secrets.token_urlsafe(32)
 
 # Immutable defaults. The service refuses to start if the on-disk
@@ -1699,7 +1701,7 @@ p { color: #64748b; font-size: 14px; margin: 0; }
 
 
 class AuthHandler(BaseHTTPRequestHandler):
-    server_version = "WebAuthFirewall/1.2.4"
+    server_version = "WebAuthFirewall/1.2.5"
 
     def handle_one_request(self):
         _REQUEST_SEMAPHORE.acquire()
@@ -2653,8 +2655,39 @@ write_state_file() {
   chmod 600 "${STATE_FILE}"
 }
 
+recover_ssh_source_from_parents() {
+  local pid="${PPID:-0}" depth env_blob value
+  for depth in {1..8}; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] && (( pid > 1 )) || break
+    env_blob="$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true)"
+    value="$(grep -m1 '^SSH_CONNECTION=' <<<"${env_blob}" | cut -d= -f2- || true)"
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+    value="$(grep -m1 '^SSH_CLIENT=' <<<"${env_blob}" | cut -d= -f2- || true)"
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+    pid="$(awk '/^PPid:/ { print $2 }' "/proc/${pid}/status" 2>/dev/null || true)"
+  done
+  return 0
+}
+
 seed_ssh_ip() {
-  local src ip
+  local src ip recovered_source
+  if [[ -z "${SSH_CLIENT:-}" && -z "${SSH_CONNECTION:-}" ]]; then
+    recovered_source="$(recover_ssh_source_from_parents)"
+    if [[ -n "${recovered_source}" ]]; then
+      if [[ "${recovered_source}" == *" "* ]]; then
+        export SSH_CONNECTION="${recovered_source}"
+      else
+        export SSH_CLIENT="${recovered_source}"
+      fi
+      say "Recovered SSH connection information across sudo."
+    fi
+  fi
   if [[ "${KEEP_SSH}" == "auto" ]]; then
     if [[ -z "${SSH_CLIENT:-}" && -z "${SSH_CONNECTION:-}" ]]; then
       return 0

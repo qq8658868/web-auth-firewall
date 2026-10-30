@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.0.1"
 REPO_RAW_BASE="${WEB_AUTH_REPO_RAW_BASE:-https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main}"
 SETUP_URL="${WEB_AUTH_SETUP_URL:-${REPO_RAW_BASE}/setup_web_firewall.sh}"
+COMMAND_PATH="${WEB_AUTH_COMMAND_PATH:-/usr/local/sbin/web-auth-firewall}"
 
 say() {
   printf '\033[1;32m[+] %s\033[0m\n' "$*"
@@ -30,6 +31,7 @@ Examples:
   sudo bash install.sh --path /my-login --allow-icmp
 
 Set WEB_AUTH_DRY_RUN=1 to download and validate the main script without running it.
+After installation, run "sudo web-auth-firewall" to open the management menu.
 EOF
 }
 
@@ -85,9 +87,13 @@ if [[ "${WEB_AUTH_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+install -d -m 755 "$(dirname "${COMMAND_PATH}")"
+install -m 700 "${tmp_file}" "${COMMAND_PATH}"
+say "Installed management command: ${COMMAND_PATH}"
+
 if [[ "$#" -eq 0 ]]; then
   set -- --install
 fi
 
 say "Starting installation"
-bash "${tmp_file}" "$@"
+bash "${COMMAND_PATH}" "$@"

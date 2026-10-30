@@ -2,8 +2,8 @@
 
 一个自包含安装脚本，把主流 Linux 服务器改造成“先登录、后放行”的白名单访问模型。
 
-- 当前脚本版本：1.2.4
-- 一键安装器版本：1.0.0
+- 当前脚本版本：1.2.5
+- 一键安装器版本：1.0.1
 
 ## 支持的系统
 
@@ -66,6 +66,18 @@ curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/in
 ```
 
 常用参数包括 `--port`、`--path`、`--allow-icmp`、`--keep-ssh` 和 `--no-keep-ssh`。不传参数时默认使用 `--install`，不会进入交互菜单。
+
+一键安装器会把主管理脚本保存到 `/usr/local/sbin/web-auth-firewall`。安装完成后，可以随时运行：
+
+```bash
+sudo web-auth-firewall
+```
+
+如果当前用户的 `PATH` 不包含 `/usr/local/sbin`，使用：
+
+```bash
+sudo /usr/local/sbin/web-auth-firewall
+```
 
 只下载并验证主脚本、不执行安装：
 
@@ -268,6 +280,18 @@ systemctl restart web-auth-firewall
 - 自动下载主安装脚本，并校验文件头、文件内容和 Shell 语法。
 - 默认传递 `--install`，支持透传端口、路径、ICMP 和 SSH 白名单参数。
 - 支持 `WEB_AUTH_DRY_RUN=1` 仅验证下载内容，以及 `WEB_AUTH_EXPECTED_SHA256` 固定版本校验。
+
+### 一键安装器 1.0.1
+
+- 将主管理脚本持久保存到 `/usr/local/sbin/web-auth-firewall`。
+- 安装完成后可直接运行 `sudo web-auth-firewall` 打开管理菜单。
+- 支持通过 `WEB_AUTH_COMMAND_PATH` 修改管理命令的安装位置。
+
+### 1.2.5
+
+- 一键安装通过 `sudo` 执行时，会从父进程环境恢复被 sudo 清理的 `SSH_CLIENT` / `SSH_CONNECTION`。
+- 修复一键安装无法识别当前 SSH 客户端 IP、安装成功后 SSH 22 端口被默认 DROP 拦截的问题。
+- 恢复 SSH 来源后继续使用原有逻辑将当前客户端 IP 自动加入 48 小时白名单。
 
 ### 1.2.4
 
