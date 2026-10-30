@@ -2,7 +2,8 @@
 
 一个自包含安装脚本，把主流 Linux 服务器改造成“先登录、后放行”的白名单访问模型。
 
-当前版本：1.2.3
+- 当前脚本版本：1.2.3
+- 一键安装器版本：1.0.0
 
 ## 支持的系统
 
@@ -42,6 +43,40 @@
 - 需要可用的 `nftables` 和 `python3`，缺失时脚本会通过系统包管理器安装。
 - 安装会接管 `/etc/nftables.conf`，并暂时停用 UFW 或 firewalld。
 - 建议通过 SSH 会话安装，不要直接在 VPS 的无人值守控制台中缺少回退方案时操作。
+
+## 一键安装
+
+复制以下整行命令到 VPS 执行即可。安装器会下载主脚本、检查脚本结构、执行 Shell 语法检查，然后自动以 `--install` 参数启动安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/install.sh | sudo bash -s --
+```
+
+也可以先下载安装器再执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/install.sh -o /tmp/web-auth-install.sh && sudo bash /tmp/web-auth-install.sh
+```
+
+一键安装器支持透传主脚本参数：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/install.sh | sudo bash -s -- --port 18622 --allow-icmp
+```
+
+常用参数包括 `--port`、`--path`、`--allow-icmp`、`--keep-ssh` 和 `--no-keep-ssh`。不传参数时默认使用 `--install`，不会进入交互菜单。
+
+只下载并验证主脚本、不执行安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/install.sh | sudo WEB_AUTH_DRY_RUN=1 bash -s --
+```
+
+直接通过管道执行远程脚本会信任 GitHub 上的最新内容。需要严格校验时，可以设置预期 SHA-256：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qq8658868/web-auth-firewall/main/install.sh | sudo WEB_AUTH_EXPECTED_SHA256=<脚本SHA256> bash -s --
+```
 
 ## 在线安装
 
@@ -225,6 +260,13 @@ systemctl restart web-auth-firewall
 - ping 使用 ICMP 协议，不属于 TCP/UDP 端口：默认情况下只有白名单 IP 可以 ping；如需让任意 IP 都能 ping，请使用 `--allow-icmp` 安装。
 
 ## 更新日志
+
+### 一键安装器 1.0.0
+
+- 新增 `install.sh` 一键引导安装器。
+- 自动下载主安装脚本，并校验文件头、文件内容和 Shell 语法。
+- 默认传递 `--install`，支持透传端口、路径、ICMP 和 SSH 白名单参数。
+- 支持 `WEB_AUTH_DRY_RUN=1` 仅验证下载内容，以及 `WEB_AUTH_EXPECTED_SHA256` 固定版本校验。
 
 ### 1.2.3
 
